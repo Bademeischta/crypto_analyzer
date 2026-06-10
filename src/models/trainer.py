@@ -119,6 +119,12 @@ class ModelTrainer:
             y_pred_dir = dir_model.predict(X_test)
             y_proba_dir = dir_model.predict_proba(X_test)
 
+            # Datumsindex für Backtest-Engine sichern
+            try:
+                test_dates = X_test.index.strftime("%Y-%m-%d").tolist()
+            except Exception:
+                test_dates = [str(d) for d in X_test.index.tolist()]
+
             fold_metric = {
                 "fold": fold_idx + 1,
                 "train_size": len(X_train),
@@ -126,6 +132,7 @@ class ModelTrainer:
                 "y_true": y_test_dir.tolist(),
                 "y_pred": y_pred_dir.tolist(),
                 "y_proba": y_proba_dir.tolist(),
+                "test_dates": test_dates,
             }
             fold_results.append(fold_metric)
             all_direction_importances.append(dir_model.feature_importances_)

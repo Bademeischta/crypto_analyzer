@@ -20,6 +20,7 @@ from src.data.fetcher import DataFetcher
 from src.data.validator import DataValidator
 from src.features.pipeline import FeaturePipeline, FeatureMatrix
 from src.features.sentiment import SentimentFetcher
+from src.backtest.engine import BacktestEngine, BacktestResult
 from src.models.evaluator import AggregatedMetrics, ModelEvaluator
 from src.models.predictor import PredictionResult, Predictor
 from src.models.trainer import ModelTrainer, TrainingResult
@@ -56,6 +57,7 @@ class AnalysisResult:
     error: str | None
     training_time_seconds: float
     data_freshness_minutes: float
+    backtest: BacktestResult | None = None
 
 
 class CryptoAnalyzer:
@@ -85,6 +87,7 @@ class CryptoAnalyzer:
         self._predictor = Predictor(self._config)
         self._evaluator = ModelEvaluator(self._config)
         self._sentiment_fetcher = SentimentFetcher(self._config, self._fetcher.cache)
+        self._backtest_engine = BacktestEngine(self._config)
 
     def analyze(
         self,
@@ -199,6 +202,14 @@ class CryptoAnalyzer:
             if v / total_imp * 100 >= self._config["ml"]["min_feature_importance_pct"]
         }
 
+        # ── Schritt 11: Backtest auf Walk-Forward-Signalen ────────────────
+        backtest_result = None
+        if training_result.fold_results:
+            try:
+                backtest_result = self._backtest_engine.run(df, training_result.fold_results)
+            except Exception as exc:
+                logger.warning(f"Backtest fehlgeschlagen: {exc}")
+
         return AnalysisResult(
             symbol=symbol.upper(),
             ohlcv=df,
@@ -211,6 +222,7 @@ class CryptoAnalyzer:
             error=None,
             training_time_seconds=round(train_duration, 2),
             data_freshness_minutes=round(data_age_minutes, 1),
+            backtest=backtest_result,
         )
 
     def get_trending_coins(self) -> list[dict[str, Any]]:
@@ -392,4 +404,5 @@ class CryptoAnalyzer:
             error=error_message,
             training_time_seconds=0.0,
             data_freshness_minutes=0.0,
+            backtest=None,
         )

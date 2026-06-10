@@ -7,7 +7,7 @@
 
 app:
   name: "Crypto Analyzer"
-  version: "1.0.0"
+  version: "2.0.0"
   log_level: "INFO"
 
 paths:
@@ -153,16 +153,19 @@ ml:
     min_folds: 3
     max_folds: 12
 
-  # HistGradientBoostingClassifier (scikit-learn) – identische Histogram-Technik wie LightGBM
-  model:
-    max_iter: 400              # Anzahl Boosting-Runden (= n_estimators)
+  # LightGBM Hyperparameter
+  lightgbm:
+    n_estimators: 400
     learning_rate: 0.05
     max_depth: 6
-    max_leaf_nodes: 31         # = num_leaves in LightGBM
-    min_samples_leaf: 20       # = min_data_in_leaf
-    n_iter_no_change: 50       # Early Stopping Rounds
-    validation_fraction: 0.1   # Interner Validation-Split für Early Stopping
+    num_leaves: 31
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    min_data_in_leaf: 20
+    early_stopping_rounds: 50
     random_state: 42
+    verbose: -1
 
   # Klassen-Labels (UI-Anzeige)
   direction_labels:
@@ -180,6 +183,36 @@ ml:
 
   # Feature-Selection
   min_feature_importance_pct: 1.0    # Features mit <1% durchschnittl. Importance werden verworfen
+
+# ============================================================================
+# BACKTESTING
+# ============================================================================
+backtest:
+  initial_capital: 10000
+  transaction_cost_pct: 0.001   # 0.1% pro Trade
+  long_only: true                # Nur Long-Positionen (kein Short/Leverage)
+  disclaimer: |
+    ⚠️ Der Backtest simuliert eine vereinfachte Strategie auf historischen Daten
+    (Walk-Forward-Signale, kein Lookahead-Bias). Transaktionskosten von 0.1% je
+    Trade sind eingerechnet. Vergangene Performance garantiert keine zukünftigen
+    Ergebnisse. Dies ist kein Anlageprodukt.
+
+# ============================================================================
+# SCREENER
+# ============================================================================
+screener:
+  default_symbols:
+    - "BTC"
+    - "ETH"
+    - "SOL"
+    - "BNB"
+    - "XRP"
+    - "ADA"
+    - "DOGE"
+    - "AVAX"
+    - "LINK"
+    - "DOT"
+  lookback_days: 180
 
 # ============================================================================
 # UI-EINSTELLUNGEN
