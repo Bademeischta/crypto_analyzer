@@ -14,6 +14,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import streamlit as st
 
+from src.backtest.engine import BacktestResult
 from src.models.predictor import PredictionResult
 from src.models.evaluator import AggregatedMetrics
 
@@ -517,3 +518,181 @@ def render_market_data_row(market_data: dict[str, Any]) -> None:
                 except (ValueError, AttributeError):
                     pass
             st.metric(label, value, help=help_text)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BACKTEST KOMPONENTEN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_backtest_metrics(bt: BacktestResult) -> None:
+    """Zeigt die wichtigsten Backtest-Kennzahlen als Metriken-Grid."""
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        delta_color = "normal" if bt.total_return_pct >= 0 else "inverse"
+        st.metric(
+            "Strategie-Rendite",
+            f"{bt.total_return_pct:+.1f}%",
+            help="Gesamtrendite der KI-Strategie im Backtest-Zeitraum",
+        )
+    with c2:
+        st.metric(
+            "Buy & Hold",
+            f"{bt.bnh_return_pct:+.1f}%",
+            help="Passive Buy-and-Hold-Strategie als Vergleich",
+        )
+    with c3:
+        alpha_sign = "+" if bt.alpha_pct >= 0 else ""
+        st.metric(
+            "Alpha vs. B&H",
+            f"{alpha_sign}{bt.alpha_pct:.1f}pp",
+            help="Überrendite der KI-Strategie gegenüber Buy & Hold",
+        )
+    with c4:
+        st.metric(
+            "Max. Drawdown",
+            f"{bt.max_drawdown_pct:.1f}%",
+            help="Maximaler Peak-to-Trough-Verlust",
+        )
+
+    c5, c6, c7, c8 = st.columns(4)
+    with c5:
+        st.metric(
+            "Sharpe Ratio",
+            f"{bt.sharpe_ratio:.2f}",
+            help="Annualisiertes Rendite/Risiko-Verhältnis (vereinfacht)",
+        )
+    with c6:
+        st.metric(
+            "Markt-Exposure",
+            f"{bt.exposure_pct:.0f}%",
+            help="Anteil der Tage mit aktiver Long-Position",
+        )
+    with c7:
+        st.metric(
+            "Anzahl Trades",
+            str(bt.n_trades),
+            help="Positionswechsel im Backtest-Zeitraum",
+        )
+    with c8:
+        st.metric(
+            "Win Rate",
+            f"{bt.win_rate_pct:.0f}%",
+            help="Anteil profitabler Long-Tage",
+        )
+
+
+def render_backtest_chart(bt: BacktestResult, symbol: str) -> go.Figure:
+    """Erstellt den Backtest-Performance-Chart (Strategie vs. Buy & Hold)."""
+    df = bt.series
+
+    fig = go.Figure()
+
+    # Strategie-Linie
+    fig.add_trace(go.Scatter(
+        x=df.index,
+        y=df["portfolio"],
+        name="KI-Strategie",
+        line=dict(color="#2196F3", width=2.5),
+        hovertemplate="%{x|%Y-%m-%d}<br>Portfolio: %{y:.1f}<extra></extra>",
+    ))
+
+    # Buy & Hold Linie
+    fig.add_trace(go.Scatter(
+        x=df.index,
+        y=df["benchmark"],
+        name="Buy & Hold",
+        line=dict(color="#FF9800", width=2, dash="dash"),
+        hovertemplate="%{x|%Y-%m-%d}<br>B&H: %{y:.1f}<extra></extra>",
+    ))
+
+    # Long-Perioden als grüne Füllung
+    long_mask = df["position"].shift(1).fillna(0) == 1
+    if long_mask.any():
+        long_df = df[long_mask]
+        fig.add_trace(go.Scatter(
+            x=long_df.index,
+            y=long_df["portfolio"],
+            name="Long-Position",
+            mode="markers",
+            marker=dict(color="#1a7f37", size=4, opacity=0.4),
+            hoverinfo="skip",
+        ))
+
+    # Baseline bei 100
+    fig.add_hline(y=100, line_dash="dot", line_color="gray", line_width=1, opacity=0.5)
+
+    final_port = df["portfolio"].iloc[-1]
+    final_bnh = df["benchmark"].iloc[-1]
+    alpha_label = f"Alpha: {bt.alpha_pct:+.1f}pp"
+    color = "#1a7f37" if bt.alpha_pct >= 0 else "#c82538"
+
+    fig.update_layout(
+        title=dict(
+            text=f"{symbol} Backtest ({bt.period_label})  ·  {alpha_label}",
+            font=dict(size=14),
+        ),
+        height=380,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        yaxis_title="Portfolio-Wert (Start = 100)",
+        xaxis_title=None,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=0, t=50, b=0),
+        xaxis=dict(gridcolor="rgba(128,128,128,0.15)"),
+        yaxis=dict(gridcolor="rgba(128,128,128,0.15)"),
+    )
+    return fig
+
+
+def render_screener_table(screener_rows: list[dict[str, Any]]) -> None:
+    """Rendert die Screener-Tabelle mit farbigen Signalen."""
+    if not screener_rows:
+        st.info("Keine Screener-Daten verfügbar.")
+        return
+
+    df = pd.DataFrame(screener_rows)
+
+    # Signal-Spalte mit Emoji
+    def format_signal(row):
+        sig = row.get("signal", "–")
+        emoji_map = {"BULLISH": "🟢 BULLISH", "BEARISH": "🔴 BEARISH", "NEUTRAL": "🟡 NEUTRAL"}
+        return emoji_map.get(sig, "⚪ –")
+
+    df["Signal"] = df.apply(format_signal, axis=1)
+
+    display_cols = {
+        "symbol": "Symbol",
+        "rsi_14": "RSI(14)",
+        "price_change_7d": "7T Änderung",
+        "Signal": "KI-Signal",
+        "confidence": "Konfidenz",
+        "adx": "ADX",
+    }
+
+    display_df = pd.DataFrame()
+    for src, label in display_cols.items():
+        if src in df.columns:
+            display_df[label] = df[src]
+
+    # Formatierung
+    if "RSI(14)" in display_df.columns:
+        display_df["RSI(14)"] = pd.to_numeric(display_df["RSI(14)"], errors="coerce").round(1)
+    if "7T Änderung" in display_df.columns:
+        display_df["7T Änderung"] = pd.to_numeric(display_df["7T Änderung"], errors="coerce")
+        display_df["7T Änderung"] = display_df["7T Änderung"].apply(
+            lambda x: f"{x:+.1f}%" if pd.notna(x) else "–"
+        )
+    if "ADX" in display_df.columns:
+        display_df["ADX"] = pd.to_numeric(display_df["ADX"], errors="coerce").round(1)
+    if "Konfidenz" in display_df.columns:
+        display_df["Konfidenz"] = display_df["Konfidenz"].apply(
+            lambda x: f"{x:.0%}" if pd.notna(x) and x is not None else "–"
+        )
+
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        height=min(400, 40 + len(display_df) * 35),
+    )
