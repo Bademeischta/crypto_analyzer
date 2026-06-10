@@ -1,0 +1,38 @@
+# Crypto Analyzer - Python 3.11+ Dependencies
+# Alle Bibliotheken sind frei nutzbar, keine kommerziellen Lizenzen.
+#
+# WICHTIG zu Versionspins:
+# Dein System/Mirror stellt pandas 2.0.0–2.0.3 bereit.
+# pandas 2.0.3 hat fertige cp311-Windows-Wheels und ist vollständig
+# kompatibel mit unserem Code.
+# numpy <2.0 wegen Kompatibilität mit der 'ta'-Bibliothek.
+
+# UI
+streamlit>=1.30.0,<2.0.0
+
+# Daten / Analyse
+pandas==2.0.3
+numpy>=1.23.0,<2.0.0
+
+# Technische Indikatoren werden direkt mit pandas/numpy berechnet.
+# Keine externe Indikatoren-Bibliothek nötig – maximale Portabilität.
+
+# Visualisierung
+plotly>=5.18.0
+
+# Machine Learning
+# LightGBM nicht auf diesem Mirror verfügbar.
+# HistGradientBoostingClassifier (scikit-learn) ist die eingebaute Alternative:
+# identische Histogram-Technik, kein separates Paket nötig.
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# Konfiguration
+PyYAML>=6.0
+
+# HTTP / Async
+requests>=2.31.0
+aiohttp>=3.9.0
+
+# Logging / CLI-Komfort
+rich>=13.7.0

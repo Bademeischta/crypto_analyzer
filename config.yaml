@@ -1,0 +1,245 @@
+# ============================================================================
+# CRYPTO ANALYZER - ZENTRALE KONFIGURATION
+# ============================================================================
+# Alle veränderlichen Werte der Anwendung sind hier definiert.
+# Code-Dateien laden Werte ausschließlich von hier — keine Magic Numbers im Code.
+# ============================================================================
+
+app:
+  name: "Crypto Analyzer"
+  version: "1.0.0"
+  log_level: "INFO"
+
+paths:
+  # Relative Pfade zur Projekt-Wurzel
+  data_dir: "data"
+  cache_dir: "data/cache"
+  models_dir: "data/models"
+  logs_dir: "data/logs"
+
+# ============================================================================
+# DATEN-QUELLEN
+# ============================================================================
+api:
+  binance:
+    base_url: "https://api.binance.com"
+    klines_endpoint: "/api/v3/klines"
+    exchange_info_endpoint: "/api/v3/exchangeInfo"
+    rate_limit_per_minute: 1200
+    quote_currency: "USDT"
+    max_klines_per_request: 1000
+    request_timeout_seconds: 15
+
+  coingecko:
+    base_url: "https://api.coingecko.com/api/v3"
+    rate_limit_per_minute: 30
+    request_timeout_seconds: 15
+
+  alternative_me:
+    base_url: "https://api.alternative.me/fng/"
+    request_timeout_seconds: 10
+
+  reddit:
+    # Reddit's anonymer JSON-Endpoint - kein OAuth, aber User-Agent erforderlich
+    base_url: "https://www.reddit.com"
+    user_agent: "CryptoAnalyzer/1.0 (educational research; non-commercial)"
+    request_timeout_seconds: 10
+    subreddits:
+      - "CryptoCurrency"
+      - "CryptoMarkets"
+      - "SatoshiStreetBets"
+    posts_per_subreddit: 25
+
+  retry:
+    # Exponentielles Backoff: 1s, 2s, 4s, 8s
+    max_attempts: 4
+    initial_backoff_seconds: 1.0
+    backoff_multiplier: 2.0
+    rate_limit_status_codes: [429]
+    transient_status_codes: [500, 502, 503, 504]
+
+# ============================================================================
+# CACHING - TTL pro Datentyp (in Sekunden)
+# ============================================================================
+cache:
+  # Kurze Candles (Minuten-Bereich)
+  ohlcv_short_ttl_seconds: 300        # 5 Minuten
+  # Lange Candles (Stunde / Tag)
+  ohlcv_long_ttl_seconds: 900         # 15 Minuten
+  # Coin-Metadaten von CoinGecko
+  metadata_ttl_seconds: 3600          # 1 Stunde
+  # Fear & Greed Index
+  fear_greed_ttl_seconds: 21600       # 6 Stunden
+  # Reddit-Posts
+  reddit_ttl_seconds: 1800            # 30 Minuten
+  # Trainierte Modelle
+  model_ttl_seconds: 86400            # 24 Stunden
+
+# ============================================================================
+# DATEN-VALIDIERUNG
+# ============================================================================
+validation:
+  # Forward-Fill bis zu N aufeinanderfolgender Lücken
+  max_consecutive_fillable_gaps: 3
+  # Outlier-Erkennung
+  volume_iqr_multiplier: 3.0
+  return_zscore_threshold: 4.0
+  # Mindestanzahl Datenpunkte für ML
+  minimum_samples_for_training: 200
+  # Mindestlistung in Tagen für Memecoin-Analyse
+  minimum_listing_days: 90
+
+# ============================================================================
+# FEATURE-ENGINEERING
+# ============================================================================
+features:
+  # Momentum
+  rsi_short_window: 7
+  rsi_long_window: 14
+  stoch_window: 14
+  stoch_smooth_window: 3
+  williams_r_window: 14
+
+  # Trend
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  ema_fast: 9
+  ema_mid: 21
+  ema_long_short: 50
+  ema_long_long: 200
+  adx_window: 14
+
+  # Volatilität
+  atr_window: 14
+  bollinger_window: 20
+  bollinger_std: 2.0
+  historical_volatility_window: 14
+
+  # Volumen
+  volume_sma_window: 20
+  vwap_window: 14
+
+  # Marktstruktur (Korrelationen werden gegen BTC und ETH berechnet)
+  correlation_window: 14
+  reference_symbols:
+    - "BTC"
+    - "ETH"
+
+  # Returns / Preisstruktur
+  return_periods: [1, 3, 7]
+  volatility_regime_window: 14
+
+# ============================================================================
+# ML-KONFIGURATION
+# ============================================================================
+ml:
+  # Direction-Modell
+  direction:
+    horizon_days: 5
+    up_threshold: 0.02      # >2% Anstieg in 5 Tagen = UP
+    down_threshold: -0.02   # <-2% in 5 Tagen = DOWN
+
+  # Volatilitäts-Modell
+  volatility:
+    lookforward_window: 5
+    low_quantile: 0.33
+    high_quantile: 0.66
+
+  # Walk-Forward Cross-Validation
+  walk_forward:
+    train_window_days: 180
+    test_window_days: 30
+    min_folds: 3
+    max_folds: 12
+
+  # HistGradientBoostingClassifier (scikit-learn) – identische Histogram-Technik wie LightGBM
+  model:
+    max_iter: 400              # Anzahl Boosting-Runden (= n_estimators)
+    learning_rate: 0.05
+    max_depth: 6
+    max_leaf_nodes: 31         # = num_leaves in LightGBM
+    min_samples_leaf: 20       # = min_data_in_leaf
+    n_iter_no_change: 50       # Early Stopping Rounds
+    validation_fraction: 0.1   # Interner Validation-Split für Early Stopping
+    random_state: 42
+
+  # Klassen-Labels (UI-Anzeige)
+  direction_labels:
+    0: "DOWN"
+    1: "NEUTRAL"
+    2: "UP"
+
+  volatility_labels:
+    0: "LOW_VOLA"
+    1: "MEDIUM_VOLA"
+    2: "HIGH_VOLA"
+
+  # Konfidenz-Schwellen
+  confidence_display_threshold: 0.55  # Erst ab 55% wird ein Signal angezeigt
+
+  # Feature-Selection
+  min_feature_importance_pct: 1.0    # Features mit <1% durchschnittl. Importance werden verworfen
+
+# ============================================================================
+# UI-EINSTELLUNGEN
+# ============================================================================
+ui:
+  page_title: "Crypto Analyzer"
+  page_icon: "📊"
+  layout: "wide"
+  default_symbol: "BTC"
+  default_interval: "1d"
+  default_lookback_days: 365
+
+  available_intervals:
+    - "1h"
+    - "4h"
+    - "1d"
+
+  popular_symbols:
+    - "BTC"
+    - "ETH"
+    - "SOL"
+    - "DOGE"
+    - "SHIB"
+    - "PEPE"
+    - "BNB"
+    - "XRP"
+    - "ADA"
+    - "AVAX"
+
+  # Pflicht-Disclaimer (immer sichtbar im UI)
+  disclaimer_short: |
+    Diese Analyse dient ausschließlich Bildungszwecken und stellt keine Finanzberatung
+    dar. Krypto-Märkte sind hochspekulativ. Handle niemals auf Basis von KI-Vorhersagen
+    allein. Vergangene Performance garantiert keine zukünftigen Ergebnisse.
+
+  disclaimer_long: |
+    ⚠️ Diese Analyse dient ausschließlich Bildungszwecken und stellt keine
+    Finanzberatung dar. Krypto-Märkte sind hochspekulativ. Handle niemals auf
+    Basis von KI-Vorhersagen allein.
+
+    Das KI-Modell basiert auf historischen Mustern. Vergangene Performance
+    garantiert keine zukünftigen Ergebnisse. Kryptowährungen können innerhalb
+    von Stunden über 50% ihres Wertes verlieren.
+
+# ============================================================================
+# Mapping: User-Symbol -> CoinGecko-ID (für Market-Cap-Abfrage)
+# ============================================================================
+coingecko_id_map:
+  BTC: "bitcoin"
+  ETH: "ethereum"
+  SOL: "solana"
+  DOGE: "dogecoin"
+  SHIB: "shiba-inu"
+  PEPE: "pepe"
+  BNB: "binancecoin"
+  XRP: "ripple"
+  ADA: "cardano"
+  AVAX: "avalanche-2"
+  MATIC: "polygon-ecosystem-token"
+  DOT: "polkadot"
+  LINK: "chainlink"
+  TRX: "tron"
+  LTC: "litecoin"
