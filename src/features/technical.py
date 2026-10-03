@@ -1,14 +1,24 @@
-"""Technische Indikatoren – reine pandas/numpy Implementierung.
+"""Technische Indikatoren – reine pandas/numpy-Implementierung.
 
 Keine externe Bibliothek (kein ta, kein pandas-ta, kein ta-lib).
-Alle Formeln sind standardisiert und verifiziert gegen bekannte Referenzen.
 
-Implementierte Indikatoren:
-  Momentum:   RSI(n), Stochastic %K/%D, Williams %R
-  Trend:      EMA(n), MACD, ADX (+DI / -DI)
-  Volatilität: ATR, Bollinger Bands, Historische Volatilität
-  Volumen:    OBV, Volumen-SMA-Ratio, VWAP-Abstand
-  Struktur:   Log-Returns, Volatilitätsregime
+Zwei Arten von Spalten:
+  - **Chart-Spalten** (absolute Preisniveaus wie EMA, Bollinger-Bänder, MACD in
+    USD): für die Visualisierung, NICHT als ML-Feature geeignet, da nicht
+    stationär – ein Modell würde sonst "BTC kostet 60k" lernen statt Muster.
+  - **Feature-Spalten**: normalisierte, stationäre Größen (Verhältnisse,
+    Oszillatoren, Returns), die über Zeit und Coins vergleichbar sind.
+
+Alle Indikatoren verwenden ausschließlich Daten bis einschließlich der
+aktuellen Kerze (kein Lookahead). Glättungen nutzen ``min_periods``, damit die
+Einschwingphase als NaN markiert wird statt verfälschte Werte zu liefern.
+
+Implementiert:
+  Momentum:    RSI (Wilder), Stochastic %K/%D
+  Trend:       EMA, MACD, ADX/DI (Wilder), Kaufman Efficiency Ratio
+  Volatilität: ATR (Wilder), Bollinger Bands, historische & Garman-Klass-Volatilität
+  Volumen:     OBV-Steigung, Volumen-Ratio/Z-Score, VWAP-Abstand, Taker-Buy-Ratio
+  Struktur:    Log-Returns, Return-Z-Score, Abstand zu Hoch/Tief
 """
 
 from __future__ import annotations
@@ -19,424 +29,352 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.config import Timeframe
+
 logger = logging.getLogger(__name__)
+
+# Rohdaten-Spalten (nie Features)
+BASE_COLUMNS: frozenset[str] = frozenset({
+    "open", "high", "low", "close", "volume", "quote_volume", "num_trades", "taker_buy_base",
+})
+
+# Lesbare Beschreibungen für die Modell-Transparenz (Präfix-Match)
+FEATURE_LABELS: dict[str, str] = {
+    "rsi_": "RSI",
+    "stoch_k": "Stochastic %K",
+    "stoch_d": "Stochastic %D",
+    "macd_pct": "MACD (relativ zum Kurs)",
+    "macd_hist_pct": "MACD-Histogramm (relativ)",
+    "ema_cross_fast_mid": "EMA-Cross schnell/mittel",
+    "ema_cross_long": "EMA-Cross 50/200",
+    "close_vs_ema_mid": "Abstand Kurs ↔ EMA mittel",
+    "close_vs_ema_long": "Abstand Kurs ↔ EMA 50",
+    "adx": "ADX (Trendstärke)",
+    "di_diff": "+DI − −DI (Trendrichtung)",
+    "efficiency_ratio": "Efficiency Ratio (Trendsauberkeit)",
+    "atr_pct": "ATR in % vom Kurs",
+    "bb_width": "Bollinger-Bandbreite",
+    "bb_pct": "Bollinger %B",
+    "hist_vol": "Historische Volatilität (ann.)",
+    "gk_vol": "Garman-Klass-Volatilität (ann.)",
+    "vol_ratio": "Volatilitäts-Ratio kurz/lang",
+    "volume_ratio": "Volumen / Ø-Volumen",
+    "volume_z": "Volumen-Z-Score",
+    "obv_slope": "OBV-Steigung (Kaufdruck)",
+    "vwap_dist": "Abstand zum VWAP",
+    "taker_buy_ratio": "Taker-Buy-Anteil (Orderflow)",
+    "ret_z": "Return-Z-Score",
+    "ret_": "Log-Return",
+    "dist_high": "Abstand zum N-Kerzen-Hoch",
+    "dist_low": "Abstand zum N-Kerzen-Tief",
+    "corr_": "Korrelation",
+    "beta_": "Beta",
+    "rel_strength_": "Relative Stärke",
+    "fng_": "Fear & Greed",
+}
+
+
+def describe_feature(name: str) -> str:
+    """Menschenlesbare Beschreibung eines Feature-Namens."""
+    for prefix, label in FEATURE_LABELS.items():
+        if name.startswith(prefix):
+            suffix = name[len(prefix):].strip("_")
+            if not suffix or not prefix.endswith("_"):
+                return label
+            if prefix in ("corr_", "beta_", "rel_strength_"):
+                suffix = suffix.upper()
+            elif prefix == "fng_":
+                suffix = {"value": "Wert", "change_7d": "Δ 7 Tage"}.get(suffix, suffix)
+            elif prefix == "ret_":
+                suffix = f"{suffix} Kerzen"
+            return f"{label} ({suffix})"
+    return name
 
 
 class TechnicalIndicators:
-    """Berechnet alle technischen Indikatoren aus dem Masterplan.
+    """Berechnet Chart-Indikatoren und stationäre ML-Features.
 
     Args:
-        config: Features-Sektion der config.yaml (vollständiges config-Dict).
+        config: Vollständiges config-Dict (nutzt Sektion ``features``).
+        interval: Kerzen-Intervall (für korrekte Annualisierung).
     """
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], interval: str = "1d") -> None:
         self._cfg = config["features"]
+        self._tf = Timeframe(interval)
+        self._chart_columns: set[str] = set()
+
+    @property
+    def chart_columns(self) -> frozenset[str]:
+        """Spalten, die nur für Charts gedacht sind (nach ``add_all`` gefüllt)."""
+        return frozenset(self._chart_columns)
 
     def add_all(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Fügt alle Indikatoren-Spalten zum DataFrame hinzu.
+        """Fügt alle Indikatoren hinzu. Das Original wird nicht verändert."""
+        out = df.copy()
+        new: dict[str, pd.Series] = {}
+        new.update(self._momentum(out))
+        new.update(self._trend(out))
+        new.update(self._volatility(out))
+        new.update(self._volume(out))
+        new.update(self._structure(out))
+        # Einmal zusammenfügen statt spaltenweise (vermeidet Fragmentierung)
+        return pd.concat([out, pd.DataFrame(new, index=out.index)], axis=1)
 
-        Args:
-            df: OHLCV-DataFrame mit Spalten open/high/low/close/volume.
-
-        Returns:
-            Erweiterter DataFrame. Original wird nicht modifiziert.
-        """
-        df = df.copy()
-        df = self._add_momentum(df)
-        df = self._add_trend(df)
-        df = self._add_volatility(df)
-        df = self._add_volume_indicators(df)
-        df = self._add_price_structure(df)
-        return df
+    def feature_columns(self, df: pd.DataFrame) -> list[str]:
+        """Alle ML-tauglichen Spalten eines von ``add_all`` erzeugten DataFrames."""
+        return [c for c in df.columns if c not in BASE_COLUMNS and c not in self._chart_columns]
 
     # ------------------------------------------------------------------
     # Momentum
     # ------------------------------------------------------------------
 
-    def _add_momentum(self, df: pd.DataFrame) -> pd.DataFrame:
-        """RSI (kurz + lang), Stochastic %K/%D, Williams %R."""
-        close = df["close"]
-        high  = df["high"]
-        low   = df["low"]
-
-        rsi_short_w  = self._cfg["rsi_short_window"]
-        rsi_long_w   = self._cfg["rsi_long_window"]
-        stoch_w      = self._cfg["stoch_window"]
-        stoch_smooth = self._cfg["stoch_smooth_window"]
-        wr_w         = self._cfg["williams_r_window"]
-
-        df[f"rsi_{rsi_short_w}"] = _rsi(close, rsi_short_w)
-        df[f"rsi_{rsi_long_w}"]  = _rsi(close, rsi_long_w)
-
-        k, d = _stochastic(high, low, close, stoch_w, stoch_smooth)
-        df["stoch_k"] = k
-        df["stoch_d"] = d
-
-        df["williams_r"] = _williams_r(high, low, close, wr_w)
-
-        return df
+    def _momentum(self, df: pd.DataFrame) -> dict[str, pd.Series]:
+        c = self._cfg
+        close, high, low = df["close"], df["high"], df["low"]
+        k, d = stochastic(high, low, close, c["stoch_window"], c["stoch_smooth_window"])
+        return {
+            f"rsi_{c['rsi_short_window']}": rsi(close, c["rsi_short_window"]),
+            f"rsi_{c['rsi_long_window']}": rsi(close, c["rsi_long_window"]),
+            "stoch_k": k,
+            "stoch_d": d,
+        }
 
     # ------------------------------------------------------------------
     # Trend
     # ------------------------------------------------------------------
 
-    def _add_trend(self, df: pd.DataFrame) -> pd.DataFrame:
-        """MACD, EMA-Crosses (normalisiert), ADX."""
+    def _trend(self, df: pd.DataFrame) -> dict[str, pd.Series]:
+        c = self._cfg
         close = df["close"]
 
-        macd_fast = self._cfg["macd_fast"]
-        macd_slow = self._cfg["macd_slow"]
-        macd_sig  = self._cfg["macd_signal"]
-        ema_fast  = self._cfg["ema_fast"]
-        ema_mid   = self._cfg["ema_mid"]
-        ema_ls    = self._cfg["ema_long_short"]
-        ema_ll    = self._cfg["ema_long_long"]
-        adx_w     = self._cfg["adx_window"]
+        ema_fast = ema(close, c["ema_fast"])
+        ema_mid = ema(close, c["ema_mid"])
+        ema_ls = ema(close, c["ema_long_short"])
+        ema_ll = ema(close, c["ema_long_long"])
+        macd_line, signal_line, hist = macd(close, c["macd_fast"], c["macd_slow"], c["macd_signal"])
+        adx_s, plus_di, minus_di = adx(df["high"], df["low"], close, c["adx_window"])
 
-        macd_line, signal_line, hist = _macd(close, macd_fast, macd_slow, macd_sig)
-        df["macd"]        = macd_line
-        df["macd_signal"] = signal_line
-        df["macd_diff"]   = hist
+        chart = {
+            f"ema_fast_{c['ema_fast']}": ema_fast,
+            f"ema_mid_{c['ema_mid']}": ema_mid,
+            f"ema_long_{c['ema_long_short']}": ema_ls,
+            f"ema_long_{c['ema_long_long']}": ema_ll,
+            "macd": macd_line,
+            "macd_signal": signal_line,
+            "macd_diff": hist,
+            "adx_pos": plus_di,
+            "adx_neg": minus_di,
+        }
+        self._chart_columns.update(chart)
 
-        ema_fast_s = _ema(close, ema_fast)
-        ema_mid_s  = _ema(close, ema_mid)
-        ema_ls_s   = _ema(close, ema_ls)
-        ema_ll_s   = _ema(close, ema_ll)
-
-        # Absolute EMA-Serien für Chart-Overlays (aus ML-Features ausgeschlossen)
-        df[f"ema_fast_{ema_fast}"] = ema_fast_s
-        df[f"ema_mid_{ema_mid}"]   = ema_mid_s
-        df[f"ema_long_{ema_ls}"]   = ema_ls_s
-
-        # Normalisierte EMA-Cross-Differenzen als ML-Feature (stationär)
-        df["ema_cross_fast_mid"] = (ema_fast_s - ema_mid_s) / ema_mid_s.replace(0, np.nan)
-        df["ema_cross_ls_ll"]    = (ema_ls_s - ema_ll_s)   / ema_ll_s.replace(0, np.nan)
-
-        adx, adx_pos, adx_neg = _adx(df["high"], df["low"], close, adx_w)
-        df["adx"]     = adx
-        df["adx_pos"] = adx_pos
-        df["adx_neg"] = adx_neg
-
-        return df
+        features = {
+            "macd_pct": macd_line / close,
+            "macd_hist_pct": hist / close,
+            "ema_cross_fast_mid": ema_fast / ema_mid - 1.0,
+            "ema_cross_long": ema_ls / ema_ll - 1.0,
+            "close_vs_ema_mid": close / ema_mid - 1.0,
+            "close_vs_ema_long": close / ema_ls - 1.0,
+            "adx": adx_s,
+            "di_diff": plus_di - minus_di,
+            "efficiency_ratio": efficiency_ratio(close, c["efficiency_window"]),
+        }
+        return {**chart, **features}
 
     # ------------------------------------------------------------------
     # Volatilität
     # ------------------------------------------------------------------
 
-    def _add_volatility(self, df: pd.DataFrame) -> pd.DataFrame:
-        """ATR, Bollinger Bands (Width + %B), historische Volatilität."""
-        close = df["close"]
-        high  = df["high"]
-        low   = df["low"]
+    def _volatility(self, df: pd.DataFrame) -> dict[str, pd.Series]:
+        c = self._cfg
+        close, high, low, open_ = df["close"], df["high"], df["low"], df["open"]
+        ann = self._tf.annualization
 
-        atr_w  = self._cfg["atr_window"]
-        bb_w   = self._cfg["bollinger_window"]
-        bb_std = self._cfg["bollinger_std"]
-        hv_w   = self._cfg["historical_volatility_window"]
-
-        df["atr"] = _atr(high, low, close, atr_w)
-
-        bb_upper, bb_mid, bb_lower = _bollinger_bands(close, bb_w, bb_std)
-        df["bb_upper"] = bb_upper
-        df["bb_lower"] = bb_lower
-        df["bb_mid"]   = bb_mid
-        # Normalisierte Bandbreite (entfernt Preisniveau-Abhängigkeit)
-        df["bb_width"] = (bb_upper - bb_lower) / bb_mid.replace(0, np.nan)
-        # Preis-Position innerhalb der Bänder [0, 1]
-        band_range = (bb_upper - bb_lower).replace(0, np.nan)
-        df["bb_pct"]   = (close - bb_lower) / band_range
-
-        # Historische Volatilität: annualisierte Std. der log-Returns
+        atr_s = atr(high, low, close, c["atr_window"])
+        upper, mid, lower = bollinger_bands(close, c["bollinger_window"], c["bollinger_std"])
         log_ret = np.log(close / close.shift(1))
-        df["hist_vol"] = log_ret.rolling(hv_w).std() * np.sqrt(252)
 
-        return df
+        chart = {"atr": atr_s, "bb_upper": upper, "bb_mid": mid, "bb_lower": lower}
+        self._chart_columns.update(chart)
+
+        hv_w = c["historical_volatility_window"]
+        short_w, long_w = c["vol_ratio_short_window"], c["vol_ratio_long_window"]
+        band = (upper - lower).replace(0, np.nan)
+        features = {
+            "atr_pct": atr_s / close,
+            "bb_width": (upper - lower) / mid.replace(0, np.nan),
+            "bb_pct": (close - lower) / band,
+            "hist_vol": log_ret.rolling(hv_w, min_periods=hv_w).std() * ann,
+            "gk_vol": garman_klass_volatility(open_, high, low, close, hv_w) * ann,
+            "vol_ratio": (
+                log_ret.rolling(short_w, min_periods=short_w).std()
+                / log_ret.rolling(long_w, min_periods=long_w).std().replace(0, np.nan)
+            ),
+        }
+        return {**chart, **features}
 
     # ------------------------------------------------------------------
     # Volumen
     # ------------------------------------------------------------------
 
-    def _add_volume_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """OBV, Volumen-SMA-Ratio, VWAP-Abstand."""
-        close  = df["close"]
-        volume = df["volume"]
-        high   = df["high"]
-        low    = df["low"]
+    def _volume(self, df: pd.DataFrame) -> dict[str, pd.Series]:
+        c = self._cfg
+        close, high, low, volume = df["close"], df["high"], df["low"], df["volume"]
+        vol_w, vwap_w, flow_w = c["volume_sma_window"], c["vwap_window"], c["orderflow_window"]
 
-        vol_sma_w = self._cfg["volume_sma_window"]
-        vwap_w    = self._cfg["vwap_window"]
+        obv_s = obv(close, volume)
+        self._chart_columns.add("obv")
 
-        df["obv"]       = _obv(close, volume)
-        obv_sma         = df["obv"].rolling(vol_sma_w).mean()
-        df["obv_trend"] = df["obv"] - obv_sma
+        vol_sum = volume.rolling(vwap_w, min_periods=vwap_w).sum().replace(0, np.nan)
+        typical = (high + low + close) / 3.0
+        vwap = (typical * volume).rolling(vwap_w, min_periods=vwap_w).sum() / vol_sum
 
-        vol_sma = volume.rolling(vol_sma_w).mean()
-        df["volume_sma_ratio"] = volume / vol_sma.replace(0, np.nan)
+        log_vol = np.log1p(volume)
+        vol_mean = log_vol.rolling(vol_w, min_periods=vol_w).mean()
+        vol_std = log_vol.rolling(vol_w, min_periods=vol_w).std().replace(0, np.nan)
+        flow_vol = volume.rolling(flow_w, min_periods=flow_w).sum().replace(0, np.nan)
 
-        # Rollender VWAP-Abstand
-        typical_price = (high + low + close) / 3
-        tp_vol         = typical_price * volume
-        rolling_vwap   = tp_vol.rolling(vwap_w).sum() / volume.rolling(vwap_w).sum()
-        df["vwap_dist"] = (close - rolling_vwap) / rolling_vwap.replace(0, np.nan)
-
-        return df
+        features: dict[str, pd.Series] = {
+            "obv": obv_s,
+            "volume_ratio": volume / volume.rolling(vol_w, min_periods=vol_w).mean().replace(0, np.nan),
+            "volume_z": (log_vol - vol_mean) / vol_std,
+            # Netto-Volumenfluss der letzten N Kerzen relativ zum Gesamtvolumen: [-1, 1]
+            "obv_slope": (obv_s - obv_s.shift(flow_w)) / flow_vol,
+            "vwap_dist": close / vwap - 1.0,
+        }
+        if "taker_buy_base" in df.columns:
+            # Anteil aggressiver Käufer am Volumen (0.5 = ausgeglichen) → zentriert auf 0
+            buy = df["taker_buy_base"].rolling(flow_w, min_periods=flow_w).sum()
+            features["taker_buy_ratio"] = buy / flow_vol - 0.5
+        return features
 
     # ------------------------------------------------------------------
-    # Preis-Struktur / Returns
+    # Preisstruktur / Returns
     # ------------------------------------------------------------------
 
-    def _add_price_structure(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Log-Returns für 1d/3d/7d, Volatilitätsregime."""
-        close          = df["close"]
-        return_periods: list[int] = self._cfg["return_periods"]
-        vola_w         = self._cfg["volatility_regime_window"]
+    def _structure(self, df: pd.DataFrame) -> dict[str, pd.Series]:
+        c = self._cfg
+        close, high, low = df["close"], df["high"], df["low"]
+        log_ret = np.log(close / close.shift(1))
+        z_w, range_w = c["return_z_window"], c["range_window"]
 
-        for p in return_periods:
-            df[f"log_return_{p}d"] = np.log(close / close.shift(p))
-
-        daily_log_ret         = np.log(close / close.shift(1))
-        df["volatility_regime"] = daily_log_ret.rolling(vola_w).std()
-
-        return df
+        features = {f"ret_{p}": np.log(close / close.shift(p)) for p in c["return_periods"]}
+        features["ret_z"] = log_ret / log_ret.rolling(z_w, min_periods=z_w).std().replace(0, np.nan)
+        features["dist_high"] = close / high.rolling(range_w, min_periods=range_w).max() - 1.0
+        features["dist_low"] = close / low.rolling(range_w, min_periods=range_w).min() - 1.0
+        return features
 
 
 # ===========================================================================
-# Freistehende Berechnungsfunktionen (pure pandas/numpy, keine externen Deps)
+# Freistehende Berechnungsfunktionen (pure pandas/numpy)
 # ===========================================================================
 
-def _ema(series: pd.Series, span: int) -> pd.Series:
-    """Exponentieller gleitender Durchschnitt (Wilder-Smoothing via ewm).
+def ema(series: pd.Series, span: int) -> pd.Series:
+    """Exponentieller gleitender Durchschnitt (alpha = 2 / (span + 1)).
 
-    Args:
-        series: Preisreihe.
-        span: Fensterlänge.
-
-    Returns:
-        EMA-Series.
+    ``min_periods=span``: Die ersten Werte sind NaN statt stark vom
+    Startwert verzerrt (wichtig z.B. für EMA 200).
     """
-    return series.ewm(span=span, adjust=False).mean()
+    return series.ewm(span=span, adjust=False, min_periods=span).mean()
 
 
-def _rsi(close: pd.Series, window: int) -> pd.Series:
-    """Relative Strength Index nach Wilder.
+def wilder_smooth(series: pd.Series, window: int) -> pd.Series:
+    """Wilder-Glättung (RMA): EMA mit alpha = 1 / window."""
+    return series.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean()
 
-    Formel: RSI = 100 - 100 / (1 + RS), RS = avg_up / avg_down
-    Verwendet EWMA (com = window - 1) wie die originale Wilder-Methode.
 
-    Args:
-        close: Schlusskurse.
-        window: RSI-Periode (typisch 14).
+def rsi(close: pd.Series, window: int) -> pd.Series:
+    """Relative Strength Index nach Wilder (0–100).
 
-    Returns:
-        RSI-Series (0–100).
+    Randfälle: nur Gewinne → 100, nur Verluste → 0, keine Bewegung → 50.
     """
     delta = close.diff()
-    gain  = delta.clip(lower=0)
-    loss  = (-delta.clip(upper=0))
+    avg_gain = wilder_smooth(delta.clip(lower=0), window)
+    avg_loss = wilder_smooth(-delta.clip(upper=0), window)
 
-    avg_gain = gain.ewm(com=window - 1, adjust=False).mean()
-    avg_loss = loss.ewm(com=window - 1, adjust=False).mean()
-
-    rs  = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return rsi
-
-
-def _macd(
-    close: pd.Series,
-    fast: int,
-    slow: int,
-    signal: int,
-) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """MACD, Signal-Linie und Histogramm.
-
-    Args:
-        close: Schlusskurse.
-        fast: Schnelle EMA-Periode (typisch 12).
-        slow: Langsame EMA-Periode (typisch 26).
-        signal: Signal-EMA-Periode (typisch 9).
-
-    Returns:
-        Tupel (macd, signal_line, histogram).
-    """
-    ema_fast    = _ema(close, fast)
-    ema_slow    = _ema(close, slow)
-    macd_line   = ema_fast - ema_slow
-    signal_line = _ema(macd_line, signal)
-    histogram   = macd_line - signal_line
-    return macd_line, signal_line, histogram
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out = 100.0 - 100.0 / (1.0 + rs)
+    out = out.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
+    out = out.mask((avg_loss == 0) & (avg_gain == 0), 50.0)
+    return out.where(avg_gain.notna() & avg_loss.notna())
 
 
-def _stochastic(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    window: int,
-    smooth: int,
+def macd(close: pd.Series, fast: int, slow: int, signal: int) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """MACD-Linie, Signal-Linie und Histogramm (in Preiseinheiten)."""
+    macd_line = ema(close, fast) - ema(close, slow)
+    signal_line = macd_line.ewm(span=signal, adjust=False, min_periods=signal).mean()
+    return macd_line, signal_line, macd_line - signal_line
+
+
+def stochastic(
+    high: pd.Series, low: pd.Series, close: pd.Series, window: int, smooth: int
 ) -> tuple[pd.Series, pd.Series]:
-    """Stochastischer Oszillator %K und %D.
+    """Stochastischer Oszillator %K und %D (0–100).
 
-    Args:
-        high: Tageshochs.
-        low: Tagestiefs.
-        close: Schlusskurse.
-        window: Lookback-Periode (typisch 14).
-        smooth: Glättungsperiode für %D (typisch 3).
-
-    Returns:
-        Tupel (%K, %D) jeweils als Series (0–100).
+    Hinweis: Williams %R ist exakt %K − 100 und wird daher nicht zusätzlich
+    als Feature geführt (perfekt korreliert = keine neue Information).
     """
-    low_n  = low.rolling(window).min()
-    high_n = high.rolling(window).max()
-    denom  = (high_n - low_n).replace(0, np.nan)
-    k = 100.0 * (close - low_n) / denom
-    d = k.rolling(smooth).mean()
-    return k, d
+    low_n = low.rolling(window, min_periods=window).min()
+    high_n = high.rolling(window, min_periods=window).max()
+    k = 100.0 * (close - low_n) / (high_n - low_n).replace(0, np.nan)
+    return k, k.rolling(smooth, min_periods=smooth).mean()
 
 
-def _williams_r(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    window: int,
-) -> pd.Series:
-    """Williams %R.
-
-    Args:
-        high: Tageshochs.
-        low: Tagestiefs.
-        close: Schlusskurse.
-        window: Lookback-Periode (typisch 14).
-
-    Returns:
-        Williams %R Series (-100–0).
-    """
-    high_n = high.rolling(window).max()
-    low_n  = low.rolling(window).min()
-    denom  = (high_n - low_n).replace(0, np.nan)
-    return -100.0 * (high_n - close) / denom
-
-
-def _atr(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    window: int,
-) -> pd.Series:
-    """Average True Range (ATR) nach Wilder.
-
-    True Range = max(H-L, |H-C_prev|, |L-C_prev|)
-
-    Args:
-        high: Tageshochs.
-        low: Tagestiefs.
-        close: Schlusskurse.
-        window: Glättungsperiode (typisch 14).
-
-    Returns:
-        ATR-Series.
-    """
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    """True Range = max(H−L, |H−C_prev|, |L−C_prev|)."""
     prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low  - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(span=window, adjust=False).mean()
+    return pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1, skipna=False).fillna(high - low)
 
 
-def _bollinger_bands(
-    close: pd.Series,
-    window: int,
-    n_std: float,
-) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Bollinger Bands.
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
+    """Average True Range nach Wilder (RMA der True Range)."""
+    return wilder_smooth(true_range(high, low, close), window)
 
-    Args:
-        close: Schlusskurse.
-        window: SMA-Periode (typisch 20).
-        n_std: Standardabweichungs-Multiplikator (typisch 2.0).
 
-    Returns:
-        Tupel (upper, middle, lower).
+def bollinger_bands(close: pd.Series, window: int, n_std: float) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Bollinger Bands (oben, Mitte, unten) mit Populations-Std (ddof=0, wie Bollinger)."""
+    mid = close.rolling(window, min_periods=window).mean()
+    std = close.rolling(window, min_periods=window).std(ddof=0)
+    return mid + n_std * std, mid, mid - n_std * std
+
+
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Average Directional Index mit +DI und −DI nach Wilder (je 0–100)."""
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=close.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=close.index)
+
+    atr_s = wilder_smooth(true_range(high, low, close), window).replace(0, np.nan)
+    plus_di = 100.0 * wilder_smooth(plus_dm, window) / atr_s
+    minus_di = 100.0 * wilder_smooth(minus_dm, window) / atr_s
+
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return wilder_smooth(dx, window), plus_di, minus_di
+
+
+def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On-Balance Volume (kumulativ)."""
+    return (volume * np.sign(close.diff()).fillna(0.0)).cumsum()
+
+
+def efficiency_ratio(close: pd.Series, window: int) -> pd.Series:
+    """Kaufman Efficiency Ratio: |Netto-Bewegung| / Summe der Einzelbewegungen (0–1).
+
+    1 = perfekt sauberer Trend, ~0 = Seitwärts-Rauschen.
     """
-    mid   = close.rolling(window).mean()
-    std   = close.rolling(window).std()
-    upper = mid + n_std * std
-    lower = mid - n_std * std
-    return upper, mid, lower
+    net = (close - close.shift(window)).abs()
+    path = close.diff().abs().rolling(window, min_periods=window).sum()
+    return net / path.replace(0, np.nan)
 
 
-def _adx(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    window: int,
-) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Average Directional Index (ADX) mit +DI und -DI.
-
-    Implementiert nach Wilder's original Methode.
-
-    Args:
-        high: Tageshochs.
-        low: Tagestiefs.
-        close: Schlusskurse.
-        window: Glättungsperiode (typisch 14).
-
-    Returns:
-        Tupel (ADX, +DI, -DI) jeweils als Series (0–100).
-    """
-    prev_high  = high.shift(1)
-    prev_low   = low.shift(1)
-    prev_close = close.shift(1)
-
-    # Directional Movement
-    up_move   = high - prev_high
-    down_move = prev_low - low
-
-    # +DM: Aufwärtsbewegung > Abwärtsbewegung und positiv
-    plus_dm  = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    plus_dm_s  = pd.Series(plus_dm,  index=close.index)
-    minus_dm_s = pd.Series(minus_dm, index=close.index)
-
-    # True Range
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low  - prev_close).abs(),
-    ], axis=1).max(axis=1)
-
-    # Wilder-Smoothing (EWMA mit com = window - 1)
-    atr_s       = tr.ewm(com=window - 1, adjust=False).mean()
-    smooth_pdm  = plus_dm_s.ewm(com=window - 1, adjust=False).mean()
-    smooth_mdm  = minus_dm_s.ewm(com=window - 1, adjust=False).mean()
-
-    # Directional Indicators
-    plus_di  = 100.0 * smooth_pdm  / atr_s.replace(0, np.nan)
-    minus_di = 100.0 * smooth_mdm  / atr_s.replace(0, np.nan)
-
-    # DX und ADX
-    di_sum  = (plus_di + minus_di).replace(0, np.nan)
-    dx      = 100.0 * (plus_di - minus_di).abs() / di_sum
-    adx     = dx.ewm(com=window - 1, adjust=False).mean()
-
-    return adx, plus_di, minus_di
-
-
-def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
-    """On-Balance Volume (OBV).
-
-    OBV steigt wenn close > prev_close, fällt wenn close < prev_close.
-
-    Args:
-        close: Schlusskurse.
-        volume: Handelsvolumen.
-
-    Returns:
-        OBV-Series (kumulativ).
-    """
-    direction = np.sign(close.diff())
-    direction.iloc[0] = 0
-    return (volume * direction).cumsum()
+def garman_klass_volatility(
+    open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series, window: int
+) -> pd.Series:
+    """Garman-Klass-Volatilität pro Kerze (nutzt OHLC → effizienter als Close-to-Close)."""
+    log_hl = np.log(high / low)
+    log_co = np.log(close / open_)
+    var = 0.5 * log_hl**2 - (2.0 * np.log(2.0) - 1.0) * log_co**2
+    return np.sqrt(var.rolling(window, min_periods=window).mean().clip(lower=0))

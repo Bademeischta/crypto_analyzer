@@ -1,0 +1,29 @@
+[project]
+name = "crypto-analyzer"
+version = "2.0.0"
+description = "KI-gestützte Krypto-Analyse mit ehrlicher Out-of-Sample-Evaluierung (nur Bildungszwecke)"
+readme = "README.md"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning:streamlit.*",
+    # pytest setzt Filter pro Test zurück; dieselbe harmlose LightGBM-Warnung wie in src/models/engine.py
+    "ignore:X does not have valid feature names:UserWarning",
+]
+
+[tool.ruff]
+line-length = 140
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I"]
+ignore = [
+    "B905",   # zip() ohne strict= – Längen sind überall konstruktionsbedingt gleich
+    "B008",   # Funktionsaufrufe in Default-Argumenten (dataclass field factories)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "conftest"]

@@ -2,56 +2,69 @@
 # CRYPTO ANALYZER - ZENTRALE KONFIGURATION
 # ============================================================================
 # Alle veränderlichen Werte der Anwendung sind hier definiert.
-# Code-Dateien laden Werte ausschließlich von hier — keine Magic Numbers im Code.
+# Zeitangaben in *Tagen* werden automatisch in Kerzen des gewählten Intervalls
+# umgerechnet (5 Tage = 5 Kerzen im 1d-Chart = 120 Kerzen im 1h-Chart).
+# Werte können auch pro Intervall angegeben werden: { "1h": 90, "1d": 365 }.
+# Änderungen an 'features' oder 'ml' invalidieren gespeicherte Modelle automatisch.
 # ============================================================================
 
 app:
   name: "Crypto Analyzer"
-  version: "1.0.0"
+  version: "2.0.0"
   log_level: "INFO"
 
 paths:
-  # Relative Pfade zur Projekt-Wurzel
+  # Relativ zum Verzeichnis dieser Datei
   data_dir: "data"
   cache_dir: "data/cache"
   models_dir: "data/models"
   logs_dir: "data/logs"
 
 # ============================================================================
-# DATEN-QUELLEN
+# DATEN-QUELLEN (alle kostenlos, kein API-Key nötig)
 # ============================================================================
 api:
+  user_agent: "CryptoAnalyzer/2.0 (educational research; non-commercial)"
+
   binance:
     base_url: "https://api.binance.com"
+    # Fallbacks bei Geo-Sperre (451/403), Ausfall oder Rate-Limit.
+    # data-api.binance.vision ist Binances offizieller Market-Data-Mirror.
+    fallback_base_urls:
+      - "https://data-api.binance.vision"
+      - "https://api1.binance.com"
     klines_endpoint: "/api/v3/klines"
-    exchange_info_endpoint: "/api/v3/exchangeInfo"
+    ticker_endpoint: "/api/v3/ticker/24hr"
     rate_limit_per_minute: 1200
     quote_currency: "USDT"
     max_klines_per_request: 1000
+    parallel_requests: 4
     request_timeout_seconds: 15
 
   coingecko:
     base_url: "https://api.coingecko.com/api/v3"
-    rate_limit_per_minute: 30
+    # Free-Tier ist streng limitiert → clientseitig drosseln statt 429 kassieren
+    rate_limit_per_minute: 20
+    max_attempts: 2
     request_timeout_seconds: 15
 
   alternative_me:
     base_url: "https://api.alternative.me/fng/"
-    request_timeout_seconds: 10
+    request_timeout_seconds: 15
 
   reddit:
-    # Reddit's anonymer JSON-Endpoint - kein OAuth, aber User-Agent erforderlich
+    # JSON-Endpoint (oft 403 ohne OAuth) → automatischer Fallback auf RSS/Atom
     base_url: "https://www.reddit.com"
-    user_agent: "CryptoAnalyzer/1.0 (educational research; non-commercial)"
+    user_agent: "python:crypto-analyzer:v2.0 (educational research; non-commercial)"
     request_timeout_seconds: 10
     subreddits:
       - "CryptoCurrency"
       - "CryptoMarkets"
       - "SatoshiStreetBets"
-    posts_per_subreddit: 25
+    posts_per_subreddit: 50
 
   retry:
-    # Exponentielles Backoff: 1s, 2s, 4s, 8s
+    # Exponentielles Backoff mit Jitter: ~1s, 2s, 4s (Retry-After wird respektiert)
     max_attempts: 4
     initial_backoff_seconds: 1.0
     backoff_multiplier: 2.0
@@ -62,35 +75,33 @@ api:
 # CACHING - TTL pro Datentyp (in Sekunden)
 # ============================================================================
 cache:
-  # Kurze Candles (Minuten-Bereich)
-  ohlcv_short_ttl_seconds: 300        # 5 Minuten
-  # Lange Candles (Stunde / Tag)
-  ohlcv_long_ttl_seconds: 900         # 15 Minuten
-  # Coin-Metadaten von CoinGecko
-  metadata_ttl_seconds: 3600          # 1 Stunde
-  # Fear & Greed Index
-  fear_greed_ttl_seconds: 21600       # 6 Stunden
-  # Reddit-Posts
-  reddit_ttl_seconds: 1800            # 30 Minuten
-  # Trainierte Modelle
-  model_ttl_seconds: 86400            # 24 Stunden
+  ohlcv_short_ttl_seconds: 120        # Intervalle < 1h
+  ohlcv_long_ttl_seconds: 600         # 1h und länger (nur neue Kerzen werden nachgeladen)
+  ticker_ttl_seconds: 60              # Live-Preis
+  universe_ttl_seconds: 900           # Coin-Liste nach Volumen
+  metadata_ttl_seconds: 3600          # CoinGecko-Marktdaten
+  coingecko_id_ttl_seconds: 604800    # Symbol → CoinGecko-ID (7 Tage)
+  fear_greed_ttl_seconds: 3600        # Fear & Greed Historie
+  reddit_ttl_seconds: 1800            # Reddit-Sentiment
+  # Maximales Modellalter bevor automatisch neu trainiert wird (Stunden)
+  model_ttl_hours:
+    "1h": 6
+    "4h": 12
+    default: 24
 
 # ============================================================================
 # DATEN-VALIDIERUNG
 # ============================================================================
 validation:
-  # Forward-Fill bis zu N aufeinanderfolgender Lücken
+  # Bis zu N fehlende Kerzen in Folge werden aufgefüllt; längere Lücken =
+  # Handelspause → nur Daten danach verwenden
   max_consecutive_fillable_gaps: 3
-  # Outlier-Erkennung
-  volume_iqr_multiplier: 3.0
-  return_zscore_threshold: 4.0
-  # Mindestanzahl Datenpunkte für ML
-  minimum_samples_for_training: 200
-  # Mindestlistung in Tagen für Memecoin-Analyse
-  minimum_listing_days: 90
+  volume_iqr_multiplier: 3.0          # auf log-Volumen
+  return_zscore_threshold: 6.0        # robuster Z-Score (Median/MAD)
+  minimum_samples_for_chart: 30
 
 # ============================================================================
-# FEATURE-ENGINEERING
+# FEATURE-ENGINEERING (Fenster in Kerzen)
 # ============================================================================
 features:
   # Momentum
@@ -98,7 +109,6 @@ features:
   rsi_long_window: 14
   stoch_window: 14
   stoch_smooth_window: 3
-  williams_r_window: 14
 
   # Trend
   macd_fast: 12
@@ -109,77 +119,122 @@ features:
   ema_long_short: 50
   ema_long_long: 200
   adx_window: 14
+  efficiency_window: 14
 
   # Volatilität
   atr_window: 14
   bollinger_window: 20
   bollinger_std: 2.0
   historical_volatility_window: 14
+  vol_ratio_short_window: 7
+  vol_ratio_long_window: 30
 
-  # Volumen
+  # Volumen / Orderflow
   volume_sma_window: 20
   vwap_window: 14
+  orderflow_window: 7
 
-  # Marktstruktur (Korrelationen werden gegen BTC und ETH berechnet)
-  correlation_window: 14
+  # Preisstruktur
+  return_periods: [1, 3, 7]
+  return_z_window: 30
+  range_window: 30
+
+  # Marktstruktur (Korrelation/Beta/relative Stärke gegenüber diesen Coins)
+  correlation_window: 30
   reference_symbols:
     - "BTC"
     - "ETH"
-
-  # Returns / Preisstruktur
-  return_periods: [1, 3, 7]
-  volatility_regime_window: 14
 
 # ============================================================================
 # ML-KONFIGURATION
 # ============================================================================
 ml:
-  # Direction-Modell
+  # auto = LightGBM wenn installiert, sonst scikit-learn HistGradientBoosting
+  engine: "auto"
+
+  # Wie viel Historie für das Training geladen wird (Tage). Mehr Historie =
+  # mehr Walk-Forward-Folds = belastbarere Evaluierung.
+  training_lookback_days:
+    "1h": 365
+    "4h": 1095
+    default: 1825
+  max_training_bars: 12000
+
   direction:
     horizon_days: 5
-    up_threshold: 0.02      # >2% Anstieg in 5 Tagen = UP
-    down_threshold: -0.02   # <-2% in 5 Tagen = DOWN
+    # volatility_adjusted: Schwelle = vol_multiplier · σ · √h (coin-spezifisch)
+    # fixed: feste Schwellen up_threshold / down_threshold
+    label_mode: "volatility_adjusted"
+    vol_multiplier: 0.4        # ≈ ausgeglichene Klassen (~30/40/30)
+    vol_lookback_days: 30
+    min_threshold: 0.005
+    up_threshold: 0.02
+    down_threshold: -0.02
 
-  # Volatilitäts-Modell
   volatility:
-    lookforward_window: 5
+    # Referenzzeitraum für die Klassengrenzen (Quantile vergangener Vola)
+    regime_lookback_days:
+      "1h": 60
+      "4h": 180
+      default: 365
     low_quantile: 0.33
     high_quantile: 0.66
 
-  # Walk-Forward Cross-Validation
+  # Purged Walk-Forward-CV (Embargo = Label-Horizont, automatisch)
   walk_forward:
-    train_window_days: 180
-    test_window_days: 30
+    mode: "expanding"          # expanding | rolling
+    min_train_days:
+      "1h": 90
+      "4h": 240
+      default: 365
+    train_window_days: 730     # nur für mode: rolling
+    test_window_days:
+      "1h": 10
+      "4h": 30
+      default: 45
+    max_folds: 20
     min_folds: 3
-    max_folds: 12
+    importance_folds: 6        # Permutation-Importance auf den letzten N Folds
+    permutation_repeats: 3
 
-  # HistGradientBoostingClassifier (scikit-learn) – identische Histogram-Technik wie LightGBM
+  # Bewusst konservativ: flache Bäume + starke Regularisierung, da Kursdaten
+  # extrem verrauscht sind. Gewählt per Out-of-Sample-Vergleich (6 Coins × 1d/4h):
+  # beste Kalibrierung und höchster Vola-Skill bei halber Trainingszeit.
+  # Keine Klassengewichte – sie verzerren die Wahrscheinlichkeiten.
   model:
-    max_iter: 400              # Anzahl Boosting-Runden (= n_estimators)
-    learning_rate: 0.05
-    max_depth: 6
-    max_leaf_nodes: 31         # = num_leaves in LightGBM
-    min_samples_leaf: 20       # = min_data_in_leaf
-    n_iter_no_change: 50       # Early Stopping Rounds
-    validation_fraction: 0.1   # Interner Validation-Split für Early Stopping
+    n_estimators: 100
+    learning_rate: 0.03
+    max_depth: 3
+    num_leaves: 8
+    min_samples_leaf: 80
+    l2_regularization: 1.0
+    subsample: 0.8             # nur LightGBM
+    colsample: 0.8             # nur LightGBM
+    class_weight: null         # oder "balanced"
+    n_jobs: 1
     random_state: 42
 
-  # Klassen-Labels (UI-Anzeige)
-  direction_labels:
-    0: "DOWN"
-    1: "NEUTRAL"
-    2: "UP"
+  # Wahrscheinlichkeits-Kalibrierung auf Out-of-Sample-Vorhersagen früherer Folds:
+  # blend = Temperature Scaling + Mischung mit Klassenhäufigkeiten (empfohlen)
+  # none  = rohe Modellwahrscheinlichkeiten (meist stark überkonfident)
+  calibration: "blend"
 
-  volatility_labels:
-    0: "LOW_VOLA"
-    1: "MEDIUM_VOLA"
-    2: "HIGH_VOLA"
+  # Walk-Forward-Folds parallel trainieren ("auto" = CPU-Kerne − 1, max. 8)
+  parallel_folds: "auto"
 
-  # Konfidenz-Schwellen
-  confidence_display_threshold: 0.55  # Erst ab 55% wird ein Signal angezeigt
+  # Erst ab dieser Klassenwahrscheinlichkeit wird ein Signal angezeigt
+  confidence_display_threshold: 0.5
+  # Signifikanzniveau für das Modell-Urteil (Binomialtest gegen Baseline)
+  significance_level: 0.05
 
-  # Feature-Selection
-  min_feature_importance_pct: 1.0    # Features mit <1% durchschnittl. Importance werden verworfen
+# ============================================================================
+# BACKTEST (Out-of-Sample-Signale aus dem Walk-Forward)
+# ============================================================================
+backtest:
+  fee_bps: 10                  # 0,10 % pro Seite (Binance Spot Taker)
+  slippage_bps: 5
+  allow_short: false
+  min_hold_bars: 1
 
 # ============================================================================
 # UI-EINSTELLUNGEN
@@ -191,6 +246,10 @@ ui:
   default_symbol: "BTC"
   default_interval: "1d"
   default_lookback_days: 365
+  # Session-Cache für Analyse-Ergebnisse (Sekunden)
+  analysis_ttl_seconds: 600
+  universe_size: 150
+  scanner_size: 12
 
   available_intervals:
     - "1h"
@@ -201,31 +260,30 @@ ui:
     - "BTC"
     - "ETH"
     - "SOL"
-    - "DOGE"
-    - "SHIB"
-    - "PEPE"
     - "BNB"
     - "XRP"
+    - "DOGE"
     - "ADA"
     - "AVAX"
+    - "SHIB"
+    - "PEPE"
 
-  # Pflicht-Disclaimer (immer sichtbar im UI)
-  disclaimer_short: |
-    Diese Analyse dient ausschließlich Bildungszwecken und stellt keine Finanzberatung
-    dar. Krypto-Märkte sind hochspekulativ. Handle niemals auf Basis von KI-Vorhersagen
-    allein. Vergangene Performance garantiert keine zukünftigen Ergebnisse.
+  disclaimer_short: >-
+    Nur zu Bildungszwecken – keine Finanzberatung. Krypto-Märkte sind hochspekulativ;
+    handle niemals allein auf Basis von KI-Vorhersagen.
 
   disclaimer_long: |
-    ⚠️ Diese Analyse dient ausschließlich Bildungszwecken und stellt keine
+    Diese Analyse dient ausschließlich Bildungszwecken und stellt keine
     Finanzberatung dar. Krypto-Märkte sind hochspekulativ. Handle niemals auf
     Basis von KI-Vorhersagen allein.
 
-    Das KI-Modell basiert auf historischen Mustern. Vergangene Performance
-    garantiert keine zukünftigen Ergebnisse. Kryptowährungen können innerhalb
-    von Stunden über 50% ihres Wertes verlieren.
+    Das KI-Modell basiert auf historischen Mustern. Vergangene Performance –
+    auch im Backtest – garantiert keine zukünftigen Ergebnisse. Kryptowährungen
+    können innerhalb von Stunden über 50% ihres Wertes verlieren.
 
 # ============================================================================
-# Mapping: User-Symbol -> CoinGecko-ID (für Market-Cap-Abfrage)
+# Mapping: Symbol → CoinGecko-ID (vermeidet Verwechslungen bei gleichen Tickern)
+# Unbekannte Symbole werden automatisch per Such-API aufgelöst.
 # ============================================================================
 coingecko_id_map:
   BTC: "bitcoin"
@@ -238,8 +296,19 @@ coingecko_id_map:
   XRP: "ripple"
   ADA: "cardano"
   AVAX: "avalanche-2"
-  MATIC: "polygon-ecosystem-token"
+  POL: "polygon-ecosystem-token"
   DOT: "polkadot"
   LINK: "chainlink"
   TRX: "tron"
   LTC: "litecoin"
+  SUI: "sui"
+  TON: "the-open-network"
+  NEAR: "near"
+  APT: "aptos"
+  ARB: "arbitrum"
+  OP: "optimism"
+  WIF: "dogwifcoin"
+  BONK: "bonk"
+  FLOKI: "floki"
+  UNI: "uniswap"
+  ATOM: "cosmos"

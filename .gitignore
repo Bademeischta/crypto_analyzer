@@ -59,3 +59,10 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Lokal erzeugte Modelle, Logs und Tool-Caches
+data/models/*.joblib
+data/models/*.tmp
+data/logs/
+*.pkl
+.ruff_cache/

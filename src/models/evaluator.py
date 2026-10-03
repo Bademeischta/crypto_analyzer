@@ -1,10 +1,20 @@
-"""Modell-Evaluierung: MCC, Precision, Log Loss, Baseline-Vergleich.
+"""Modell-Evaluierung auf echten Out-of-Sample-Vorhersagen (Walk-Forward-OOF).
 
-Der Baseline-Vergleich ("immer NEUTRAL vorhersagen") ist kritisch:
-Wenn das ML-Modell schlechter ist als diese triviale Strategie,
-sagt das Dashboard dem Nutzer explizit, dass das Modell unzuverlässig ist.
-
-Ehrlichkeit hat hier Priorität vor einem "beeindruckenden" Interface.
+Ehrlichkeit vor Eindruck:
+  * Hauptkriterium ist der **Log-Loss-Skill** gegenüber der Prior-Baseline
+    (Klassenhäufigkeiten des jeweiligen Trainingsblocks = beste Vorhersage
+    ohne jede Marktinformation). Log-Loss ist eine "proper scoring rule":
+    Er belohnt nur echte, gut kalibrierte Information – anders als Accuracy,
+    die man z.B. durch ständiges Raten der Mehrheitsklasse aufblähen kann.
+  * Signifikanz per einseitigem t-Test auf Block-Mittelwerten der
+    Log-Loss-Differenzen. Da sich die h-Kerzen-Labels überlappen, sind
+    benachbarte Fehler korreliert; Blöcke der Länge h machen die Stichproben
+    näherungsweise unabhängig (n/h *effektive* Stichproben).
+  * Zusätzlich: Accuracy vs. Mehrheitsklasse (Binomialtest), MCC,
+    balancierte Accuracy.
+  * Signal-Qualität: Wie oft lag das Modell richtig, *wenn* es ein Signal
+    oberhalb der Konfidenzschwelle gab – und was passierte danach im Schnitt
+    mit dem Kurs?
 """
 
 from __future__ import annotations
@@ -14,262 +24,343 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+import pandas as pd
+from scipy.stats import binomtest, ttest_1samp
 from sklearn.metrics import (
-    log_loss,
+    accuracy_score,
+    balanced_accuracy_score,
+    confusion_matrix,
     matthews_corrcoef,
     precision_score,
-    accuracy_score,
+    recall_score,
 )
 
 logger = logging.getLogger(__name__)
 
-# Klassen-Label-Mapping für Ausgaben
-_LABEL_MAP = {0: "BEARISH", 1: "NEUTRAL", 2: "BULLISH"}
-
-
-@dataclass
-class FoldMetrics:
-    """Metriken für einen einzelnen Walk-Forward-Fold.
-
-    Attributes:
-        fold: Fold-Nummer (1-basiert).
-        accuracy: Gesamt-Accuracy.
-        mcc: Matthews Correlation Coefficient (-1 bis +1).
-        log_loss_val: Kalibrierungs-Metrik.
-        precision_per_class: Precision pro Klasse.
-        baseline_accuracy: Accuracy der "immer NEUTRAL"-Strategie.
-        beats_baseline: True wenn Modell > Baseline-Accuracy.
-        n_up: Anzahl UP-Samples im Testset.
-        n_neutral: Anzahl NEUTRAL-Samples im Testset.
-        n_down: Anzahl DOWN-Samples im Testset.
-    """
-
-    fold: int
-    accuracy: float
-    mcc: float
-    log_loss_val: float
-    precision_per_class: dict[str, float]
-    baseline_accuracy: float
-    beats_baseline: bool
-    n_up: int
-    n_neutral: int
-    n_down: int
+DIRECTION_NAMES: dict[int, str] = {0: "BEARISH", 1: "NEUTRAL", 2: "BULLISH"}
+VOLATILITY_NAMES: dict[int, str] = {0: "NIEDRIG", 1: "MITTEL", 2: "HOCH"}
+_PROBA_COLS = ("p_down", "p_neutral", "p_up")
+_LABELS = [0, 1, 2]
 
 
 @dataclass
 class AggregatedMetrics:
-    """Aggregierte Metriken über alle Walk-Forward-Folds.
+    """Out-of-Sample-Metriken des Richtungsmodells.
 
     Attributes:
-        avg_accuracy: Durchschnittliche Accuracy (ehrlich anzeigen: oft 52-58%).
-        avg_mcc: Durchschnittlicher MCC.
-        avg_log_loss: Durchschnittlicher Log Loss.
-        avg_precision_per_class: Durchschnittliche Precision pro Klasse.
-        baseline_accuracy: Baseline ("immer NEUTRAL").
-        beats_baseline_pct: Anteil der Folds wo Modell > Baseline (0.0-1.0).
-        model_is_useful: True wenn Modell in >60% der Folds die Baseline schlägt.
-        n_folds: Anzahl ausgewerteter Folds.
-        fold_accuracies: Accuracy pro Fold (für Stabilitätseinschätzung).
-        disclaimer: Ehrlicher Text über Modell-Limitierungen.
+        n_samples: Anzahl OOF-Vorhersagen.
+        n_folds: Anzahl Walk-Forward-Folds.
+        effective_samples: Überlappungsfreie Stichproben (n / Horizont).
+        accuracy / balanced_accuracy / mcc / log_loss / brier: Klassifikationsmetriken.
+        log_loss_prior: Log-Loss der Prior-Baseline (Klassenhäufigkeiten).
+        skill_score: 1 − LogLoss_Modell / LogLoss_Prior (> 0 = Modell informativer).
+        baseline_accuracy: Accuracy der Mehrheitsklassen-Baseline.
+        neutral_baseline_accuracy: Accuracy von "immer NEUTRAL".
+        beats_baseline_pct: Anteil der Folds, in denen das Modell die Prior-Baseline im Log-Loss schlägt.
+        p_value: t-Test Log-Loss-Skill > 0 (einseitig, blockweise).
+        accuracy_p_value: Binomialtest Accuracy > Mehrheitsklasse (einseitig).
+        verdict: "signifikant", "schwach" oder "keine Vorhersagekraft".
+        model_is_useful: True bei signifikanter Überlegenheit.
+        confusion: 3×3-Konfusionsmatrix (Zeilen = wahr, Spalten = vorhergesagt).
+        precision_per_class / recall_per_class: je Klasse.
+        fold_table: Metriken je Fold.
+        calibration: Zuverlässigkeitsdiagramm-Daten (vorhergesagt vs. beobachtet).
+        signal_stats: Qualität der Signale über der Konfidenzschwelle je Richtung.
+        unconditional_avg_return: Durchschnittlicher Horizont-Return ohne Signal.
+        disclaimer: Ehrlicher, datenbasierter Einordnungstext.
     """
 
-    avg_accuracy: float
-    avg_mcc: float
-    avg_log_loss: float
-    avg_precision_per_class: dict[str, float]
-    baseline_accuracy: float
-    beats_baseline_pct: float
-    model_is_useful: bool
+    n_samples: int
     n_folds: int
-    fold_accuracies: list[float]
+    effective_samples: int
+    accuracy: float
+    balanced_accuracy: float
+    mcc: float
+    log_loss: float
+    brier: float
+    log_loss_prior: float
+    skill_score: float
+    baseline_accuracy: float
+    neutral_baseline_accuracy: float
+    beats_baseline_pct: float
+    p_value: float
+    accuracy_p_value: float
+    verdict: str
+    model_is_useful: bool
+    confusion: list[list[int]]
+    precision_per_class: dict[str, float]
+    recall_per_class: dict[str, float]
+    fold_table: list[dict[str, Any]]
+    calibration: list[dict[str, float]]
+    signal_stats: dict[str, dict[str, float]]
+    unconditional_avg_return: float
     disclaimer: str
+
+    @property
+    def fold_accuracies(self) -> list[float]:
+        return [f["accuracy"] for f in self.fold_table]
+
+    @property
+    def avg_accuracy(self) -> float:
+        return self.accuracy
+
+    @property
+    def avg_mcc(self) -> float:
+        return self.mcc
+
+
+@dataclass
+class VolatilityMetrics:
+    """Out-of-Sample-Metriken des Volatilitätsmodells.
+
+    Volatilität ist – anders als die Kursrichtung – nachweislich teilweise
+    vorhersagbar (Volatility Clustering: ruhige Phasen folgen auf ruhige,
+    hektische auf hektische).
+    """
+
+    accuracy: float
+    baseline_accuracy: float
+    mcc: float
+    balanced_accuracy: float
+    skill_score: float = 0.0
+    p_value: float = float("nan")
+    verdict: str = ""
+    confusion: list[list[int]] = field(default_factory=list)
 
 
 class ModelEvaluator:
-    """Berechnet alle Evaluierungs-Metriken aus Walk-Forward-Fold-Ergebnissen.
+    """Berechnet alle Evaluierungs-Metriken aus den OOF-Vorhersagen.
 
     Args:
         config: Geladenes config.yaml als Dict.
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
-        self._ml_cfg = config["ml"]
+        self._threshold = config["ml"]["confidence_display_threshold"]
+        self._alpha = config["ml"]["significance_level"]
 
-    def evaluate_folds(self, fold_results: list[dict[str, Any]]) -> AggregatedMetrics:
-        """Wertet alle Walk-Forward-Folds aus und aggregiert die Metriken.
+    def evaluate(self, oof: pd.DataFrame, horizon_bars: int) -> AggregatedMetrics | None:
+        """Wertet die OOF-Richtungsvorhersagen aus (None bei leeren Daten)."""
+        if oof is None or oof.empty:
+            return None
 
-        Args:
-            fold_results: Liste von Fold-Dicts aus dem Trainer
-                         (mit 'y_true', 'y_pred', 'y_proba', 'fold').
+        y = oof["y_true"].to_numpy(dtype=int)
+        pred = oof["pred"].to_numpy(dtype=int)
+        proba = oof[list(_PROBA_COLS)].to_numpy(dtype=float)
+        majority = oof["majority"].to_numpy(dtype=int)
+        prior = _prior_matrix(oof, y)
+        idx = np.arange(len(y))
 
-        Returns:
-            AggregatedMetrics mit aggregierten Werten und Baseline-Vergleich.
-        """
-        if not fold_results:
-            return self._empty_metrics()
+        ll_model_i = -np.log(np.clip(proba[idx, y], 1e-12, 1.0))
+        ll_prior_i = -np.log(np.clip(prior[idx, y], 1e-12, 1.0))
+        ll_model, ll_prior = float(ll_model_i.mean()), float(ll_prior_i.mean())
+        skill = 1.0 - ll_model / ll_prior if ll_prior > 0 else 0.0
+        p_value = _block_ttest_p(ll_prior_i - ll_model_i, max(1, horizon_bars))
 
-        fold_metrics: list[FoldMetrics] = []
-        for fold_data in fold_results:
-            metrics = self._evaluate_single_fold(fold_data)
-            fold_metrics.append(metrics)
+        acc = float(accuracy_score(y, pred))
+        base_acc = float(np.mean(y == majority))
+        neutral_acc = float(np.mean(y == 1))
+        mcc = float(matthews_corrcoef(y, pred)) if len(np.unique(y)) > 1 else 0.0
+        n_eff = max(1, len(y) // max(1, horizon_bars))
+        acc_p = self._binomial_p(acc, base_acc, n_eff)
 
-        return self._aggregate(fold_metrics)
+        fold_table = []
+        fold_ids = oof["fold"].to_numpy()
+        for fold in np.unique(fold_ids):
+            pos = np.flatnonzero(fold_ids == fold)
+            g_y, g_pred = y[pos], pred[pos]
+            fold_table.append({
+                "fold": int(fold),
+                "start": oof.index[pos[0]],
+                "end": oof.index[pos[-1]],
+                "n": len(pos),
+                "accuracy": round(float(np.mean(g_y == g_pred)), 4),
+                "baseline": round(float(np.mean(g_y == majority[pos])), 4),
+                "log_loss": round(float(ll_model_i[pos].mean()), 4),
+                "log_loss_prior": round(float(ll_prior_i[pos].mean()), 4),
+                "mcc": round(float(matthews_corrcoef(g_y, g_pred)) if len(np.unique(g_y)) > 1 else 0.0, 4),
+            })
+        beats_pct = float(np.mean([f["log_loss"] < f["log_loss_prior"] for f in fold_table]))
 
-    def _evaluate_single_fold(self, fold_data: dict[str, Any]) -> FoldMetrics:
-        """Berechnet Metriken für einen einzelnen Fold.
-
-        Args:
-            fold_data: Dict mit y_true, y_pred, y_proba, fold.
-
-        Returns:
-            FoldMetrics.
-        """
-        y_true = np.array(fold_data["y_true"])
-        y_pred = np.array(fold_data["y_pred"])
-        y_proba = np.array(fold_data["y_proba"])
-        fold_num = fold_data["fold"]
-
-        # Basis-Metriken
-        acc = float(accuracy_score(y_true, y_pred))
-        mcc = float(matthews_corrcoef(y_true, y_pred))
-
-        # Log Loss: robuster bei fehlenden Klassen (labels explizit angeben)
-        try:
-            ll = float(log_loss(y_true, y_proba, labels=[0, 1, 2]))
-        except ValueError:
-            ll = float("nan")
-
-        # Precision pro Klasse (zero_division=0 verhindert Fehler bei fehlenden Klassen)
-        prec_vals = precision_score(
-            y_true, y_pred,
-            labels=[0, 1, 2],
-            average=None,
-            zero_division=0,
-        )
-        precision_per_class = {
-            _LABEL_MAP[i]: round(float(p), 3)
-            for i, p in enumerate(prec_vals)
-        }
-
-        # Baseline: "immer NEUTRAL vorhersagen"
-        neutral_class = 1
-        baseline_pred = np.full_like(y_pred, neutral_class)
-        baseline_acc = float(accuracy_score(y_true, baseline_pred))
-        beats_baseline = acc > baseline_acc
-
-        # Klassenverteilung für UI-Info
-        n_up = int(np.sum(y_true == 2))
-        n_neutral = int(np.sum(y_true == 1))
-        n_down = int(np.sum(y_true == 0))
-
-        return FoldMetrics(
-            fold=fold_num,
+        verdict, useful = self._verdict(p_value, skill, mcc)
+        return AggregatedMetrics(
+            n_samples=len(y),
+            n_folds=len(fold_table),
+            effective_samples=n_eff,
             accuracy=round(acc, 4),
+            balanced_accuracy=round(float(balanced_accuracy_score(y, pred)), 4),
             mcc=round(mcc, 4),
-            log_loss_val=round(ll, 4) if not np.isnan(ll) else 0.0,
-            precision_per_class=precision_per_class,
-            baseline_accuracy=round(baseline_acc, 4),
-            beats_baseline=beats_baseline,
-            n_up=n_up,
-            n_neutral=n_neutral,
-            n_down=n_down,
+            log_loss=round(ll_model, 4),
+            brier=round(_multiclass_brier(y, proba), 4),
+            log_loss_prior=round(ll_prior, 4),
+            skill_score=round(skill, 4),
+            baseline_accuracy=round(base_acc, 4),
+            neutral_baseline_accuracy=round(neutral_acc, 4),
+            beats_baseline_pct=round(beats_pct, 3),
+            p_value=round(p_value, 4) if not np.isnan(p_value) else float("nan"),
+            accuracy_p_value=round(acc_p, 4) if not np.isnan(acc_p) else float("nan"),
+            verdict=verdict,
+            model_is_useful=useful,
+            confusion=confusion_matrix(y, pred, labels=_LABELS).tolist(),
+            precision_per_class=_per_class(precision_score, y, pred),
+            recall_per_class=_per_class(recall_score, y, pred),
+            fold_table=fold_table,
+            calibration=_calibration_table(proba, y),
+            signal_stats=self.signal_statistics(oof, self._threshold),
+            unconditional_avg_return=float(oof["fwd_ret"].mean()),
+            disclaimer=self._disclaimer(verdict, skill, acc, base_acc, beats_pct, p_value, n_eff),
         )
 
-    def _aggregate(self, fold_metrics: list[FoldMetrics]) -> AggregatedMetrics:
-        """Aggregiert Fold-Metriken zu Gesamt-Metriken.
+    def evaluate_volatility(self, oof: pd.DataFrame, horizon_bars: int = 1) -> VolatilityMetrics | None:
+        """Wertet die OOF-Vorhersagen des Volatilitätsmodells aus."""
+        if oof is None or oof.empty or "vol_true" not in oof:
+            return None
+        y = oof["vol_true"].to_numpy(dtype=int)
+        pred = oof["vol_pred"].to_numpy(dtype=int)
+        proba = oof[["vp_low", "vp_medium", "vp_high"]].to_numpy(dtype=float)
+        prior_cols = ["vprior_low", "vprior_medium", "vprior_high"]
+        if all(c in oof.columns for c in prior_cols):
+            prior = oof[prior_cols].to_numpy(dtype=float)
+        else:
+            prior = np.tile(np.bincount(y, minlength=3) / len(y), (len(y), 1))
+        idx = np.arange(len(y))
+        ll_model_i = -np.log(np.clip(proba[idx, y], 1e-12, 1.0))
+        ll_prior_i = -np.log(np.clip(prior[idx, y], 1e-12, 1.0))
+        skill = 1.0 - ll_model_i.mean() / ll_prior_i.mean()
+        p_value = _block_ttest_p(ll_prior_i - ll_model_i, max(1, horizon_bars))
+        mcc = float(matthews_corrcoef(y, pred)) if len(np.unique(y)) > 1 else 0.0
+        verdict, _ = self._verdict(p_value, skill, mcc)
+        return VolatilityMetrics(
+            accuracy=round(float(np.mean(y == pred)), 4),
+            baseline_accuracy=round(float(np.mean(y == oof["vol_majority"].to_numpy(dtype=int))), 4),
+            mcc=round(mcc, 4),
+            balanced_accuracy=round(float(balanced_accuracy_score(y, pred)), 4),
+            skill_score=round(float(skill), 4),
+            p_value=round(p_value, 4) if not np.isnan(p_value) else float("nan"),
+            verdict=verdict,
+            confusion=confusion_matrix(y, pred, labels=_LABELS).tolist(),
+        )
 
-        Args:
-            fold_metrics: Liste der Einzel-Fold-Metriken.
+    @staticmethod
+    def signal_statistics(oof: pd.DataFrame, threshold: float) -> dict[str, dict[str, float]]:
+        """Trefferquote und Folge-Returns für Signale oberhalb der Konfidenzschwelle.
 
         Returns:
-            AggregatedMetrics.
+            {"BULLISH": {...}, "BEARISH": {...}, "NEUTRAL": {...}} mit n_signals,
+            coverage (Anteil aller Zeitpunkte), hit_rate (Label korrekt),
+            direction_hit_rate (Kurs bewegte sich in Signalrichtung),
+            avg_return / median_return (Horizont-Return nach dem Signal).
         """
-        accuracies = [m.accuracy for m in fold_metrics]
-        mccs = [m.mcc for m in fold_metrics]
-        log_losses = [m.log_loss_val for m in fold_metrics if m.log_loss_val > 0]
-        baseline_accs = [m.baseline_accuracy for m in fold_metrics]
-        beats_count = sum(1 for m in fold_metrics if m.beats_baseline)
+        proba = oof[list(_PROBA_COLS)].to_numpy(dtype=float)
+        pred = proba.argmax(axis=1)
+        confident = proba.max(axis=1) >= threshold
+        y = oof["y_true"].to_numpy(dtype=int)
+        fwd = oof["fwd_ret"].to_numpy(dtype=float)
+        stats: dict[str, dict[str, float]] = {}
+        for cls, name in DIRECTION_NAMES.items():
+            mask = confident & (pred == cls)
+            n = int(mask.sum())
+            if n == 0:
+                stats[name] = {"n_signals": 0, "coverage": 0.0}
+                continue
+            if cls == 2:
+                direction_hits = float(np.mean(fwd[mask] > 0))
+            elif cls == 0:
+                direction_hits = float(np.mean(fwd[mask] < 0))
+            else:
+                direction_hits = float("nan")
+            stats[name] = {
+                "n_signals": n,
+                "coverage": round(n / len(oof), 4),
+                "hit_rate": round(float(np.mean(y[mask] == cls)), 4),
+                "direction_hit_rate": round(direction_hits, 4) if not np.isnan(direction_hits) else float("nan"),
+                "avg_return": float(np.nanmean(fwd[mask])),
+                "median_return": float(np.nanmedian(fwd[mask])),
+            }
+        return stats
 
-        avg_acc = float(np.mean(accuracies))
-        avg_mcc = float(np.mean(mccs))
-        avg_ll = float(np.mean(log_losses)) if log_losses else 0.0
-        avg_baseline = float(np.mean(baseline_accs))
-        beats_baseline_pct = beats_count / len(fold_metrics)
-        model_is_useful = beats_baseline_pct >= 0.6
+    # ------------------------------------------------------------------
+    # Intern
+    # ------------------------------------------------------------------
 
-        # Precision pro Klasse: Durchschnitt über Folds
-        avg_prec: dict[str, float] = {}
-        for label in _LABEL_MAP.values():
-            vals = [m.precision_per_class.get(label, 0.0) for m in fold_metrics]
-            avg_prec[label] = round(float(np.mean(vals)), 3)
+    @staticmethod
+    def _binomial_p(acc: float, baseline: float, n_eff: int) -> float:
+        if n_eff < 10 or not 0.0 < baseline < 1.0:
+            return float("nan")
+        k = int(round(acc * n_eff))
+        return float(binomtest(k, n_eff, baseline, alternative="greater").pvalue)
 
-        # Ehrlicher Disclaimer basierend auf tatsächlicher Performance
-        disclaimer = self._generate_disclaimer(avg_acc, avg_mcc, beats_baseline_pct, model_is_useful)
+    def _verdict(self, p_value: float, skill: float, mcc: float) -> tuple[str, bool]:
+        if not np.isnan(p_value) and p_value < self._alpha and skill > 0:
+            return "signifikant", True
+        if skill > 0 and mcc > 0:
+            return "schwach", False
+        return "keine Vorhersagekraft", False
 
-        return AggregatedMetrics(
-            avg_accuracy=round(avg_acc, 4),
-            avg_mcc=round(avg_mcc, 4),
-            avg_log_loss=round(avg_ll, 4),
-            avg_precision_per_class=avg_prec,
-            baseline_accuracy=round(avg_baseline, 4),
-            beats_baseline_pct=round(beats_baseline_pct, 3),
-            model_is_useful=model_is_useful,
-            n_folds=len(fold_metrics),
-            fold_accuracies=accuracies,
-            disclaimer=disclaimer,
-        )
-
-    def _generate_disclaimer(
-        self,
-        accuracy: float,
-        mcc: float,
-        beats_baseline_pct: float,
-        model_is_useful: bool,
+    @staticmethod
+    def _disclaimer(
+        verdict: str, skill: float, acc: float, base: float, beats: float, p: float, n_eff: int
     ) -> str:
-        """Generiert einen ehrlichen, datengestützten Disclaimer.
-
-        Args:
-            accuracy: Durchschnittliche Accuracy.
-            mcc: Durchschnittlicher MCC.
-            beats_baseline_pct: Anteil Folds die die Baseline schlagen.
-            model_is_useful: True wenn Modell als nützlich eingestuft wird.
-
-        Returns:
-            Menschenlesbarer Disclaimer-Text.
-        """
-        acc_pct = int(accuracy * 100)
-        beats_pct = int(beats_baseline_pct * 100)
-
-        if not model_is_useful:
-            return (
-                f"⚠️ Eingeschränkte Zuverlässigkeit: Das Modell schlägt die naive "
-                f"'immer NEUTRAL'-Strategie nur in {beats_pct}% der Testperioden. "
-                f"Die historische Trefferquote liegt bei {acc_pct}%. "
-                f"Signale sollten mit besonderer Vorsicht interpretiert werden."
-            )
-        if accuracy < 0.55:
-            return (
-                f"ℹ️ Mäßige Zuverlässigkeit: Historische Trefferquote {acc_pct}% "
-                f"(schlägt Baseline in {beats_pct}% der Perioden). "
-                f"Krypto-Märkte sind schwer vorherzusagen – dies ist ein normaler Wert."
-            )
+        p_txt = "n/a" if np.isnan(p) else f"{p:.3f}"
+        core = (
+            f"Log-Loss-Skill {skill:+.1%} gegenüber reinem Raten nach Klassenhäufigkeit "
+            f"(p = {p_txt}, {n_eff} unabhängige Stichproben), besser in {beats:.0%} der "
+            f"Testperioden. Trefferquote {acc:.0%} vs. {base:.0%} für die Mehrheitsklasse."
+        )
+        if verdict == "signifikant":
+            return f"✅ Statistisch signifikanter Informationsgehalt. {core} Vergangenheit garantiert keine Zukunft."
+        if verdict == "schwach":
+            return f"ℹ️ Leichter, aber nicht signifikanter Vorsprung – kann Zufall sein. {core}"
         return (
-            f"✅ Modell schlägt die Baseline in {beats_pct}% der Testperioden "
-            f"(historische Accuracy: {acc_pct}%). "
-            f"Dennoch: Vergangene Performance garantiert keine zukünftigen Ergebnisse."
+            f"⚠️ Keine nachweisbare Vorhersagekraft für diesen Coin/Zeitraum. {core} "
+            f"Signale bitte nur als Einordnung der Indikatorlage verstehen."
         )
 
-    def _empty_metrics(self) -> AggregatedMetrics:
-        """Leere Metriken wenn keine Fold-Daten vorhanden."""
-        return AggregatedMetrics(
-            avg_accuracy=0.0,
-            avg_mcc=0.0,
-            avg_log_loss=0.0,
-            avg_precision_per_class={},
-            baseline_accuracy=0.0,
-            beats_baseline_pct=0.0,
-            model_is_useful=False,
-            n_folds=0,
-            fold_accuracies=[],
-            disclaimer="Keine Evaluierungsdaten verfügbar.",
-        )
+
+def _prior_matrix(oof: pd.DataFrame, y: np.ndarray) -> np.ndarray:
+    """Prior-Wahrscheinlichkeiten je Zeile (aus dem Trainingsblock, sonst global)."""
+    cols = ["prior_down", "prior_neutral", "prior_up"]
+    if all(c in oof.columns for c in cols):
+        return oof[cols].to_numpy(dtype=float)
+    freq = np.bincount(y, minlength=3) / max(1, len(y))
+    return np.tile(freq, (len(y), 1))
+
+
+def _block_ttest_p(diff: np.ndarray, block: int) -> float:
+    """Einseitiger t-Test (Mittelwert > 0) auf Mittelwerten nicht-überlappender Blöcke."""
+    n_blocks = len(diff) // block
+    if n_blocks < 10:
+        return float("nan")
+    means = diff[: n_blocks * block].reshape(n_blocks, block).mean(axis=1)
+    if np.isclose(means.std(), 0.0):
+        # Keine Streuung: eindeutig besser (p≈0) bzw. nicht besser (p=1)
+        return 0.0 if means.mean() > 0 else 1.0
+    return float(ttest_1samp(means, 0.0, alternative="greater").pvalue)
+
+
+def _per_class(metric: Any, y: np.ndarray, pred: np.ndarray) -> dict[str, float]:
+    values = metric(y, pred, labels=_LABELS, average=None, zero_division=0)
+    return {DIRECTION_NAMES[i]: round(float(v), 3) for i, v in enumerate(values)}
+
+
+def _multiclass_brier(y: np.ndarray, proba: np.ndarray) -> float:
+    onehot = np.eye(len(_LABELS))[y]
+    return float(np.mean(np.sum((proba - onehot) ** 2, axis=1)))
+
+
+def _calibration_table(proba: np.ndarray, y: np.ndarray, n_bins: int = 6) -> list[dict[str, float]]:
+    """Konfidenz (max. Wahrscheinlichkeit) vs. tatsächliche Trefferquote je Bin."""
+    conf = proba.max(axis=1)
+    correct = proba.argmax(axis=1) == y
+    edges = np.linspace(1 / 3, 1.0, n_bins + 1)
+    rows = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        mask = (conf >= lo) & (conf < hi if hi < 1.0 else conf <= hi)
+        if mask.sum() >= 5:
+            rows.append({
+                "bin": f"{lo:.0%}–{hi:.0%}",
+                "predicted": round(float(conf[mask].mean()), 4),
+                "observed": round(float(correct[mask].mean()), 4),
+                "count": int(mask.sum()),
+            })
+    return rows

@@ -1,32 +1,46 @@
 """Sentiment-Daten: Fear & Greed Index (alternative.me) und Reddit-Posts.
 
-Reddit-Zugriff erfolgt über den öffentlichen JSON-Endpoint ohne OAuth.
-Laut Reddit-Nutzungsbedingungen ist nicht-kommerzieller Lesezugriff erlaubt,
-solange ein identifizierbarer User-Agent gesetzt wird.
+Fear & Greed wird als **komplette Historie** geladen (ein Request, seit 2018)
+und kann so als zeitlich korrektes ML-Feature dienen – statt eines einzelnen
+aktuellen Werts, der rückwirkend auf alle historischen Zeilen kopiert würde
+(das wäre Lookahead-Bias).
+
+Reddit: Der anonyme JSON-Endpoint wird inzwischen häufig mit 403 blockiert.
+Als Fallback wird der öffentliche RSS/Atom-Feed desselben Subreddits gelesen.
 """
 
 from __future__ import annotations
 
 import logging
+import re
+import threading
 import time
+import xml.etree.ElementTree as ET
 from typing import Any
 
-import requests
-import yaml
-from pathlib import Path
+import pandas as pd
 
 from src.data.cache import DiskCache
+from src.data.http import ApiError, HttpClient
 
 logger = logging.getLogger(__name__)
 
-# Einfache bullish/bearish Keyword-Listen für Memecoin-Sentiment
+_ATOM_NS = "{http://www.w3.org/2005/Atom}"
+# Nach einem Rate-Limit Reddit für diese Zeit meiden (Sekunden)
+_REDDIT_COOLDOWN_SECONDS = 600
+_TOKEN_RE = re.compile(r"[a-z0-9']+")
+
 _BULLISH_KEYWORDS = frozenset({
-    "moon", "pump", "buy", "long", "bullish", "gem", "launch",
-    "breakout", "ath", "surge", "rocket", "hodl", "accumulate",
+    "moon", "mooning", "pump", "pumping", "buy", "buying", "long", "bullish", "bull", "gem",
+    "breakout", "ath", "surge", "surging", "rocket", "hodl", "accumulate", "accumulating",
+    "rally", "rallying", "soar", "soaring", "uptrend", "undervalued", "adoption", "etf",
+    "approval", "approved", "partnership", "green", "gains", "rebound",
 })
 _BEARISH_KEYWORDS = frozenset({
-    "dump", "sell", "short", "bearish", "crash", "rug", "scam",
-    "dead", "exit", "correction", "fear", "panic", "rekt",
+    "dump", "dumping", "sell", "selling", "short", "bearish", "bear", "crash", "crashing",
+    "rug", "rugpull", "scam", "dead", "exit", "correction", "fear", "panic", "rekt",
+    "plunge", "plunging", "collapse", "liquidated", "liquidation", "hack", "hacked",
+    "exploit", "downtrend", "overvalued", "bubble", "lawsuit", "sec", "ban", "red", "losses",
 })
 
 
@@ -36,251 +50,286 @@ class SentimentFetcher:
     Args:
         config: Geladenes config.yaml als Dict.
         cache: DiskCache-Instanz.
+        http: Gemeinsamer HttpClient.
     """
 
-    def __init__(self, config: dict[str, Any], cache: DiskCache) -> None:
+    def __init__(self, config: dict[str, Any], cache: DiskCache, http: HttpClient) -> None:
         self._cfg_fg = config["api"]["alternative_me"]
         self._cfg_reddit = config["api"]["reddit"]
-        self._cfg_retry = config["api"]["retry"]
         self._cache_cfg = config["cache"]
         self._cache = cache
+        self._http = http
+        # Circuit-Breaker: blockierte Reddit-Zugriffswege merken (Prozess-weit)
+        self._reddit_lock = threading.Lock()
+        self._json_blocked = False
+        self._reddit_cooldown_until = 0.0
 
-    def get_fear_greed(self, history_days: int = 10) -> dict[str, Any]:
-        """Fetcht den Fear & Greed Index von alternative.me.
+    # ------------------------------------------------------------------
+    # Fear & Greed
+    # ------------------------------------------------------------------
 
-        Args:
-            history_days: Anzahl historischer Tageswerte (max 30 sinnvoll).
+    def get_fear_greed_history(self) -> pd.Series:
+        """Komplette Fear-&-Greed-Historie als tägliche Serie.
 
         Returns:
-            Dict mit Schlüsseln:
-              - current_value (int, 0-100)
-              - current_label (str, z.B. "Extreme Fear")
-              - history (list[dict] mit value, label, timestamp)
-              - change_3d (float, Änderung über 3 Tage, positiv = mehr Gier)
+            Series (0–100) mit UTC-DatetimeIndex (Tagesbeginn), aufsteigend.
+            Leer, wenn die API nicht erreichbar ist und kein Cache existiert.
         """
-        cache_key = f"fear_greed_{history_days}d"
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            return cached
+        return _records_to_series(self._fear_greed_records())
 
-        url = self._cfg_fg["base_url"]
-        params = {"limit": max(history_days, 4), "format": "json"}
+    def get_fear_greed(self, history_days: int = 90) -> dict[str, Any]:
+        """Aktueller Fear & Greed Index plus Verlauf für die UI.
 
-        try:
-            response = self._get_with_retry(url, params=params)
-            raw = response.json()
-            data_list = raw.get("data", [])
-
-            if not data_list:
-                return self._empty_fear_greed()
-
-            history = [
-                {
-                    "value": int(item["value"]),
-                    "label": item["value_classification"],
-                    "timestamp": int(item["timestamp"]),
-                }
-                for item in data_list
-            ]
-
-            current_value = history[0]["value"]
-            current_label = history[0]["label"]
-
-            # Änderung über 3 Tage (positiv = mehr Gier)
-            change_3d = 0.0
-            if len(history) >= 4:
-                change_3d = float(current_value - history[3]["value"])
-
-            result = {
-                "current_value": current_value,
-                "current_label": current_label,
-                "history": history[:history_days],
-                "change_3d": change_3d,
+        Returns:
+            Dict: current_value, current_label, change_1d, change_7d, change_30d,
+            avg_30d, history (Liste von {date, value}).
+        """
+        records = self._fear_greed_records()
+        series = _records_to_series(records)
+        if series.empty:
+            return {
+                "current_value": None,
+                "current_label": "Nicht verfügbar",
+                "history": [],
+                "change_1d": None,
+                "change_7d": None,
+                "change_30d": None,
+                "avg_30d": None,
             }
 
-            self._cache.set(cache_key, result, self._cache_cfg["fear_greed_ttl_seconds"])
-            return result
+        def change(days: int) -> float | None:
+            if len(series) <= days:
+                return None
+            return float(series.iloc[-1] - series.iloc[-1 - days])
 
-        except (requests.RequestException, KeyError, ValueError, TypeError) as exc:
+        labels = {int(r[0]): r[2] for r in records}
+        current = int(series.iloc[-1])
+        recent = series.iloc[-history_days:]
+        return {
+            "current_value": current,
+            "current_label": labels.get(int(series.index[-1].timestamp())) or classify_fear_greed(current),
+            "change_1d": change(1),
+            "change_7d": change(7),
+            "change_30d": change(30),
+            "avg_30d": float(series.iloc[-30:].mean()),
+            "history": [{"date": ts.strftime("%Y-%m-%d"), "value": int(v)} for ts, v in recent.items()],
+        }
+
+    def _fear_greed_records(self) -> list[list[Any]]:
+        """Rohdaten [timestamp, value, label] – gecacht, mit Stale-Fallback."""
+        key = "fear_greed_history"
+        records = self._cache.get(key)
+        if records is not None:
+            return records
+        try:
+            raw = self._http.get_json(
+                self._cfg_fg["base_url"],
+                params={"limit": 0, "format": "json"},
+                timeout=self._cfg_fg["request_timeout_seconds"],
+            )
+            records = [
+                [int(item["timestamp"]), int(item["value"]), item.get("value_classification", "")]
+                for item in raw.get("data", [])
+            ]
+            if records:
+                self._cache.set(key, records, self._cache_cfg["fear_greed_ttl_seconds"])
+            return records
+        except (ApiError, KeyError, TypeError, ValueError) as exc:
             logger.warning(f"Fear & Greed API nicht erreichbar: {exc}")
-            return self._empty_fear_greed()
+            stale = self._cache.get_stale(key)
+            return stale[0] if stale else []
 
-    def get_reddit_sentiment(self, symbol: str) -> dict[str, Any]:
-        """Fetcht und analysiert Reddit-Posts für ein Coin-Symbol.
+    # ------------------------------------------------------------------
+    # Reddit
+    # ------------------------------------------------------------------
 
-        Durchsucht r/CryptoCurrency, r/CryptoMarkets, r/SatoshiStreetBets
-        nach Posts die das Symbol erwähnen. Kein OAuth nötig.
+    def get_reddit_sentiment(self, symbol: str, aliases: list[str] | None = None) -> dict[str, Any]:
+        """Keyword-basiertes Sentiment aus Reddit-Posts, die den Coin erwähnen.
 
         Args:
-            symbol: Coin-Symbol (z.B. "BTC", "DOGE").
+            symbol: Ticker (z.B. "SOL"). Wird nur als eigenständiges Wort in
+                GROSSBUCHSTABEN oder mit $-Präfix gezählt ("SOL", "$sol"), damit
+                "sol" nicht in "solution" matcht.
+            aliases: Zusätzliche Namen (z.B. ["Solana"]), case-insensitiv.
 
         Returns:
-            Dict mit Schlüsseln:
-              - post_count (int): Anzahl relevanter Posts
-              - bullish_score (float, 0-1): Anteil bullisher Posts
-              - bearish_score (float, 0-1): Anteil bearisher Posts
-              - neutral_score (float, 0-1): Anteil neutraler Posts
-              - avg_upvotes (float): Durchschnittliche Upvotes relevanter Posts
-              - top_titles (list[str]): Top-3 Post-Titel
-              - subreddits_checked (list[str])
+            Dict mit post_count, bullish/bearish/neutral_score, net_sentiment
+            (−1…+1), avg_upvotes (None bei RSS), top_titles, source, error.
         """
-        cache_key = f"reddit_sentiment_{symbol.upper()}"
-        cached = self._cache.get(cache_key)
+        sym = symbol.upper()
+        key = f"reddit_sentiment_{sym}"
+        cached = self._cache.get(key)
         if cached is not None:
             return cached
 
         subreddits: list[str] = self._cfg_reddit["subreddits"]
-        posts_per_sub: int = self._cfg_reddit["posts_per_subreddit"]
-        headers = {"User-Agent": self._cfg_reddit["user_agent"]}
+        posts = self._collect_posts(subreddits)
+        errors = [p["error"] for p in posts if "error" in p]
+        posts = [p for p in posts if "error" not in p]
+        sources = {p["source"] for p in posts}
 
-        all_posts: list[dict[str, Any]] = []
-
-        for subreddit in subreddits:
-            url = f"{self._cfg_reddit['base_url']}/r/{subreddit}/hot.json"
-            params: dict[str, Any] = {"limit": posts_per_sub}
-            try:
-                # Pause zwischen Reddit-Requests um Rate-Limiting zu vermeiden
-                time.sleep(0.5)
-                response = self._get_with_retry(url, params=params, headers=headers)
-                data = response.json()
-                posts = data.get("data", {}).get("children", [])
-                for post in posts:
-                    pd_data = post.get("data", {})
-                    all_posts.append({
-                        "title": pd_data.get("title", ""),
-                        "score": pd_data.get("score", 0),
-                        "num_comments": pd_data.get("num_comments", 0),
-                        "subreddit": subreddit,
-                    })
-            except (requests.RequestException, KeyError, ValueError) as exc:
-                logger.warning(f"Reddit-Fehler für r/{subreddit}: {exc}")
-                continue
-
-        result = self._analyze_reddit_posts(all_posts, symbol, subreddits)
-        self._cache.set(cache_key, result, self._cache_cfg["reddit_ttl_seconds"])
+        result = analyze_posts(posts, sym, aliases or [])
+        result["subreddits_checked"] = subreddits
+        result["total_posts_scanned"] = len(posts)
+        result["source"] = "/".join(sorted(sources)) or "nicht erreichbar"
+        result["error"] = "; ".join(errors) if not posts and errors else None
+        # Fehlschläge nur kurz cachen, damit ein späterer Versuch möglich bleibt
+        ttl = self._cache_cfg["reddit_ttl_seconds"] if posts else 300
+        self._cache.set(key, result, ttl)
         return result
 
-    def _analyze_reddit_posts(
-        self,
-        posts: list[dict[str, Any]],
-        symbol: str,
-        subreddits: list[str],
-    ) -> dict[str, Any]:
-        """Analysiert Posts nach Symbol-Erwähnungen und Sentiment.
+    def _collect_posts(self, subreddits: list[str]) -> list[dict[str, Any]]:
+        """Hot-Posts aller Subreddits (gemeinsam gecacht, damit jeder Coin sie wiederverwendet)."""
+        key = "reddit_hot_posts"
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        if time.monotonic() < self._reddit_cooldown_until:
+            return [{"error": "Reddit-Rate-Limit – Pause aktiv"}]
 
-        Args:
-            posts: Liste aller gesammelten Posts.
-            symbol: Coin-Symbol nach dem gesucht wird.
-            subreddits: Liste der durchsuchten Subreddits.
+        posts: list[dict[str, Any]] = []
+        for sub in subreddits:
+            fetched, error = self._fetch_subreddit(sub)
+            posts.extend(fetched)
+            if error:
+                posts.append({"error": f"r/{sub}: {error}"})
+                if "429" in error:
+                    with self._reddit_lock:
+                        self._reddit_cooldown_until = time.monotonic() + _REDDIT_COOLDOWN_SECONDS
+                    break  # weitere Anfragen würden nur ebenfalls geblockt
+        if any("error" not in p for p in posts):
+            self._cache.set(key, posts, self._cache_cfg["reddit_ttl_seconds"])
+        return posts
 
-        Returns:
-            Sentiment-Analyse-Dict.
-        """
-        sym_lower = symbol.lower()
-        relevant: list[dict[str, Any]] = []
+    def _fetch_subreddit(self, sub: str) -> tuple[list[dict[str, Any]], str | None]:
+        base = self._cfg_reddit["base_url"]
+        limit = self._cfg_reddit["posts_per_subreddit"]
+        timeout = self._cfg_reddit["request_timeout_seconds"]
+        headers = {"User-Agent": self._cfg_reddit["user_agent"]}
 
-        for post in posts:
-            title_lower = post["title"].lower()
-            if sym_lower in title_lower or f"${sym_lower}" in title_lower:
-                relevant.append(post)
-
-        if not relevant:
-            return {
-                "post_count": 0,
-                "bullish_score": 0.0,
-                "bearish_score": 0.0,
-                "neutral_score": 1.0,
-                "avg_upvotes": 0.0,
-                "top_titles": [],
-                "subreddits_checked": subreddits,
-            }
-
-        bullish_count = 0
-        bearish_count = 0
-
-        for post in relevant:
-            words = set(post["title"].lower().split())
-            is_bullish = bool(words & _BULLISH_KEYWORDS)
-            is_bearish = bool(words & _BEARISH_KEYWORDS)
-            if is_bullish and not is_bearish:
-                bullish_count += 1
-            elif is_bearish and not is_bullish:
-                bearish_count += 1
-
-        total = len(relevant)
-        neutral_count = total - bullish_count - bearish_count
-
-        # Nach Score (Upvotes) sortieren für Top-Titel
-        sorted_posts = sorted(relevant, key=lambda p: p["score"], reverse=True)
-        top_titles = [p["title"] for p in sorted_posts[:3]]
-        avg_upvotes = sum(p["score"] for p in relevant) / total
-
-        return {
-            "post_count": total,
-            "bullish_score": round(bullish_count / total, 3),
-            "bearish_score": round(bearish_count / total, 3),
-            "neutral_score": round(neutral_count / total, 3),
-            "avg_upvotes": round(avg_upvotes, 1),
-            "top_titles": top_titles,
-            "subreddits_checked": subreddits,
-        }
-
-    def _get_with_retry(
-        self,
-        url: str,
-        params: dict[str, Any] | None = None,
-        headers: dict[str, str] | None = None,
-    ) -> requests.Response:
-        """HTTP-GET mit exponentiellem Backoff (intern, ohne Import-Zirkularität)."""
-        max_attempts = self._cfg_retry["max_attempts"]
-        initial_backoff = self._cfg_retry["initial_backoff_seconds"]
-        multiplier = self._cfg_retry["backoff_multiplier"]
-        rate_limit_codes: list[int] = self._cfg_retry["rate_limit_status_codes"]
-        transient_codes: list[int] = self._cfg_retry["transient_status_codes"]
-        retryable = set(rate_limit_codes + transient_codes)
-        timeout = 10
-
-        last_exc: Exception | None = None
-        for attempt in range(max_attempts):
+        if not self._json_blocked:
             try:
-                response = requests.get(url, params=params, headers=headers, timeout=timeout)
-                if response.status_code == 200:
-                    return response
-                if response.status_code in retryable:
-                    wait = initial_backoff * (multiplier ** attempt)
-                    time.sleep(wait)
-                    continue
-                response.raise_for_status()
-            except (requests.ConnectionError, requests.Timeout) as exc:
-                last_exc = exc
-                if attempt < max_attempts - 1:
-                    wait = initial_backoff * (multiplier ** attempt)
-                    time.sleep(wait)
+                data = self._http.get_json(
+                    f"{base}/r/{sub}/hot.json", params={"limit": limit}, headers=headers,
+                    timeout=timeout, max_attempts=1,
+                )
+                posts = [
+                    {
+                        "title": child.get("data", {}).get("title", ""),
+                        "score": child.get("data", {}).get("score", 0),
+                        "subreddit": sub,
+                        "source": "json",
+                    }
+                    for child in data.get("data", {}).get("children", [])
+                ]
+                return posts, None
+            except ApiError as exc:
+                if exc.status_code == 403:
+                    self._json_blocked = True  # JSON dauerhaft gesperrt → direkt RSS nutzen
+                logger.debug(f"Reddit-JSON r/{sub} fehlgeschlagen ({exc}) – versuche RSS.")
 
-        if last_exc:
-            raise last_exc
-        raise requests.ConnectionError(f"Alle Versuche für {url} fehlgeschlagen.")
+        try:
+            response = self._http.get(
+                f"{base}/r/{sub}/hot.rss", params={"limit": limit},
+                headers={**headers, "Accept": "application/atom+xml"},
+                timeout=timeout, max_attempts=1,
+            )
+            return parse_atom_titles(response.text, sub), None
+        except (ApiError, ET.ParseError) as exc:
+            logger.info(f"Reddit r/{sub} nicht erreichbar: {exc}")
+            status = getattr(exc, "status_code", None)
+            return [], f"HTTP {status}" if status else str(exc)[:80]
 
-    def _empty_fear_greed(self) -> dict[str, Any]:
-        """Leeres Fear & Greed Ergebnis bei API-Ausfall."""
+
+# ===========================================================================
+# Reine Hilfsfunktionen (testbar ohne Netzwerk)
+# ===========================================================================
+
+def _records_to_series(records: list[list[Any]]) -> pd.Series:
+    if not records:
+        return pd.Series(dtype="float64", name="fear_greed")
+    idx = pd.to_datetime([int(r[0]) for r in records], unit="s", utc=True)
+    series = pd.Series([float(r[1]) for r in records], index=idx, name="fear_greed")
+    return series[~series.index.duplicated()].sort_index()
+
+
+def classify_fear_greed(value: float) -> str:
+    """Klassifikation analog alternative.me."""
+    if value < 25:
+        return "Extreme Fear"
+    if value < 46:
+        return "Fear"
+    if value < 55:
+        return "Neutral"
+    if value < 76:
+        return "Greed"
+    return "Extreme Greed"
+
+
+def parse_atom_titles(xml_text: str, subreddit: str) -> list[dict[str, Any]]:
+    """Extrahiert Post-Titel aus einem Reddit-Atom-Feed."""
+    root = ET.fromstring(xml_text)
+    return [
+        {
+            "title": (entry.findtext(f"{_ATOM_NS}title") or "").strip(),
+            "score": None,
+            "subreddit": subreddit,
+            "source": "rss",
+        }
+        for entry in root.iter(f"{_ATOM_NS}entry")
+    ]
+
+
+def mentions(title: str, symbol: str, aliases: list[str]) -> bool:
+    """True wenn der Titel den Coin erwähnt (Wortgrenzen-sicher)."""
+    sym = re.escape(symbol.upper())
+    # Ticker: exakt in Großbuchstaben oder mit $-Präfix (beliebige Schreibweise)
+    if re.search(rf"(?<![A-Za-z0-9])(?:{sym}|\$(?i:{sym}))(?![A-Za-z0-9])", title):
+        return True
+    for alias in aliases:
+        if alias and re.search(rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])", title, re.IGNORECASE):
+            return True
+    return False
+
+
+def score_title(title: str) -> int:
+    """+1 bullish, −1 bearish, 0 neutral/gemischt."""
+    tokens = set(_TOKEN_RE.findall(title.lower()))
+    bull = bool(tokens & _BULLISH_KEYWORDS)
+    bear = bool(tokens & _BEARISH_KEYWORDS)
+    if bull and not bear:
+        return 1
+    if bear and not bull:
+        return -1
+    return 0
+
+
+def analyze_posts(posts: list[dict[str, Any]], symbol: str, aliases: list[str]) -> dict[str, Any]:
+    """Filtert relevante Posts und aggregiert das Keyword-Sentiment."""
+    relevant = [p for p in posts if p.get("title") and mentions(p["title"], symbol, aliases)]
+    if not relevant:
         return {
-            "current_value": None,
-            "current_label": "Nicht verfügbar",
-            "history": [],
-            "change_3d": None,
+            "post_count": 0,
+            "bullish_score": 0.0,
+            "bearish_score": 0.0,
+            "neutral_score": 1.0,
+            "net_sentiment": 0.0,
+            "avg_upvotes": None,
+            "top_titles": [],
         }
 
-
-def load_sentiment_fetcher(config_path: Path, cache: DiskCache) -> SentimentFetcher:
-    """Factory-Funktion die config.yaml lädt und SentimentFetcher erstellt.
-
-    Args:
-        config_path: Pfad zur config.yaml.
-        cache: DiskCache-Instanz.
-
-    Returns:
-        Initialisierter SentimentFetcher.
-    """
-    with config_path.open(encoding="utf-8") as fh:
-        config = yaml.safe_load(fh)
-    return SentimentFetcher(config, cache)
+    scores = [score_title(p["title"]) for p in relevant]
+    total = len(relevant)
+    bull = sum(1 for s in scores if s > 0)
+    bear = sum(1 for s in scores if s < 0)
+    upvotes = [p["score"] for p in relevant if p.get("score") is not None]
+    ranked = sorted(relevant, key=lambda p: p.get("score") or 0, reverse=True)
+    return {
+        "post_count": total,
+        "bullish_score": round(bull / total, 3),
+        "bearish_score": round(bear / total, 3),
+        "neutral_score": round((total - bull - bear) / total, 3),
+        "net_sentiment": round((bull - bear) / total, 3),
+        "avg_upvotes": round(sum(upvotes) / len(upvotes), 1) if upvotes else None,
+        "top_titles": [p["title"] for p in ranked[:5]],
+    }

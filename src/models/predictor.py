@@ -1,22 +1,25 @@
-"""Inferenz: Wandelt einen Feature-Vektor in ein Signal mit Konfidenz um.
+"""Inferenz: Wandelt den aktuellen Feature-Vektor in ein Signal mit Kontext um.
 
-Konfidenz wird NUR angezeigt wenn max. Klassenwahrscheinlichkeit > 0.55.
-Darunter gibt das System "Kein klares Signal" aus (ehrlicher als erzwungene Labels).
+Ein Signal wird nur angezeigt, wenn die höchste Klassenwahrscheinlichkeit
+die Konfidenzschwelle erreicht. Zusätzlich wird aus der Out-of-Sample-
+Historie angegeben, wie verlässlich vergleichbare Signale in der Vergangenheit
+waren – eine nackte "Konfidenz" eines Baummodells ist nicht kalibriert.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
+from src.config import Timeframe
+from src.models.engine import Calibration, predict_proba_aligned
+
 logger = logging.getLogger(__name__)
 
-# Sprachangepasste Labels für die UI
 _DIRECTION_LABELS: dict[int, str] = {0: "BEARISH", 1: "NEUTRAL", 2: "BULLISH"}
 _DIRECTION_EMOJIS: dict[int, str] = {0: "🔴", 1: "🟡", 2: "🟢"}
 _VOLATILITY_LABELS: dict[int, str] = {0: "NIEDRIG", 1: "MITTEL", 2: "HOCH"}
@@ -31,15 +34,17 @@ class PredictionResult:
         direction_label: "BEARISH", "NEUTRAL" oder "BULLISH".
         direction_emoji: Passender Emoji.
         direction_class: Numerische Klasse (0, 1, 2).
-        confidence: Konfidenz als float (0.0-1.0). None wenn unter Schwelle.
-        show_signal: False wenn Konfidenz < Threshold (ehrliches "Kein Signal").
-        probabilities: Dict label -> Wahrscheinlichkeit für alle 3 Klassen.
-        volatility_label: "NIEDRIG", "MITTEL" oder "HOCH".
-        volatility_color: CSS-Farbname.
-        volatility_class: Numerische Klasse (0, 1, 2).
-        horizon_days: Vorhersage-Horizont in Tagen.
-        data_end_date: Datum des letzten Trainingsdatenpunkts.
-        no_signal_reason: Erklärung warum kein Signal angezeigt wird (wenn show_signal=False).
+        confidence: Höchste Klassenwahrscheinlichkeit (None wenn unter Schwelle).
+        show_signal: False wenn Konfidenz < Schwelle ("Kein klares Signal").
+        probabilities: Label → Wahrscheinlichkeit.
+        volatility_label / volatility_color / volatility_class: Erwartetes Vola-Regime.
+        volatility_probabilities: Label → Wahrscheinlichkeit.
+        horizon_bars / horizon_text: Vorhersage-Horizont.
+        up_threshold_pct / down_threshold_pct: Return-Schwellen der Klassen in %.
+        data_end_date: Letzte abgeschlossene Kerze.
+        no_signal_reason: Erklärung bei show_signal=False.
+        historical: Kennzahlen früherer Signale derselben Richtung (OOF).
+        model_verdict: Urteil der Evaluierung ("signifikant", "schwach", ...).
     """
 
     direction_label: str
@@ -51,125 +56,138 @@ class PredictionResult:
     volatility_label: str
     volatility_color: str
     volatility_class: int
-    horizon_days: int
+    volatility_probabilities: dict[str, float]
+    horizon_bars: int
+    horizon_text: str
+    up_threshold_pct: float
+    down_threshold_pct: float
     data_end_date: str
     no_signal_reason: str = ""
+    historical: dict[str, float] = field(default_factory=dict)
+    model_verdict: str = ""
+
+    @property
+    def horizon_days(self) -> str:
+        """Rückwärtskompatibler Alias für den Horizont-Text."""
+        return self.horizon_text
 
 
 class Predictor:
-    """Erzeugt Vorhersagen aus trainierten LightGBM-Modellen.
+    """Erzeugt Vorhersagen aus trainierten Modellen.
 
     Args:
         config: Geladenes config.yaml als Dict.
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
-        self._ml_cfg = config["ml"]
-        self._confidence_threshold = config["ml"]["confidence_display_threshold"]
-        self._horizon = config["ml"]["direction"]["horizon_days"]
+        self._threshold = config["ml"]["confidence_display_threshold"]
 
     def predict(
         self,
-        direction_model: lgb.LGBMClassifier,
-        volatility_model: lgb.LGBMClassifier,
+        direction_model: Any,
+        volatility_model: Any,
         feature_row: pd.Series,
         feature_names: list[str],
+        required_features: list[str],
+        interval: str,
+        horizon_bars: int,
+        thresholds: tuple[float, float],
         data_end_date: str,
+        signal_stats: dict[str, dict[str, float]] | None = None,
+        model_verdict: str = "",
+        calibration: Calibration | None = None,
+        volatility_calibration: Calibration | None = None,
+        class_prior: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3),
+        volatility_prior: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3),
     ) -> PredictionResult:
-        """Erstellt eine vollständige Vorhersage für einen Feature-Vektor.
+        """Erstellt eine Vorhersage für den aktuellen Feature-Vektor.
 
         Args:
-            direction_model: Trainiertes Richtungs-Klassifikationsmodell.
-            volatility_model: Trainiertes Volatilitäts-Klassifikationsmodell.
-            feature_row: Letzter Feature-Vektor (aus FeatureMatrix.last_row).
-            feature_names: Erwartete Feature-Namen (für Reihenfolge-Sicherheit).
-            data_end_date: Datum des letzten bekannten Datenpunkts.
-
-        Returns:
-            PredictionResult mit allen Informationen für das UI.
+            direction_model / volatility_model: Trainierte Modelle.
+            feature_row: Aktueller Feature-Vektor.
+            feature_names: Feature-Reihenfolge der Modelle.
+            required_features: Features, die nicht NaN sein dürfen.
+            interval: Kerzen-Intervall.
+            horizon_bars: Horizont in Kerzen.
+            thresholds: (down, up) Return-Schwellen.
+            data_end_date: Letzte abgeschlossene Kerze.
+            signal_stats: OOF-Signalstatistik aus dem Evaluator.
+            model_verdict: Urteil der Evaluierung.
+            calibration / volatility_calibration: Kalibrierung aus dem Walk-Forward.
+            class_prior / volatility_prior: Klassenhäufigkeiten im Training.
         """
-        # Feature-Vektor in korrekte Reihenfolge bringen
-        try:
-            X = feature_row[feature_names].values.reshape(1, -1)
-        except KeyError as exc:
-            logger.error(f"Feature-Mismatch: {exc}")
-            return self._no_signal_result(
-                data_end_date,
-                "Feature-Inkonsistenz: Modell neu trainieren.",
-            )
-
-        # NaN-Check: Wenn der letzte Feature-Vektor NaN enthält → kein Signal
-        if np.any(np.isnan(X)):
-            nan_count = np.sum(np.isnan(X))
-            return self._no_signal_result(
-                data_end_date,
-                f"{nan_count} Features haben keinen Wert (zu wenig Daten für Indikatoren). "
-                f"Lade mehr historische Daten.",
-            )
-
-        # Richtungs-Vorhersage
-        dir_proba = direction_model.predict_proba(X)[0]
-        dir_class = int(np.argmax(dir_proba))
-        max_confidence = float(dir_proba[dir_class])
-
-        # Konfidenz-Threshold: Unter 55% kein Signal
-        show_signal = max_confidence >= self._confidence_threshold
-        confidence = max_confidence if show_signal else None
-        no_signal_reason = (
-            ""
-            if show_signal
-            else (
-                f"Die höchste Klassenwahrscheinlichkeit liegt bei "
-                f"{max_confidence:.0%} (Schwelle: {self._confidence_threshold:.0%}). "
-                f"Das Modell ist sich bei diesem Coin aktuell nicht sicher genug."
-            )
-        )
-
-        probabilities = {
-            _DIRECTION_LABELS[i]: round(float(p), 3)
-            for i, p in enumerate(dir_proba)
+        horizon_text = Timeframe(interval).describe_bars(horizon_bars)
+        base = {
+            "horizon_bars": horizon_bars,
+            "horizon_text": horizon_text,
+            "down_threshold_pct": thresholds[0] * 100,
+            "up_threshold_pct": thresholds[1] * 100,
+            "data_end_date": data_end_date,
+            "model_verdict": model_verdict,
         }
 
-        # Volatilitäts-Vorhersage
-        vola_proba = volatility_model.predict_proba(X)[0]
-        vola_class = int(np.argmax(vola_proba))
+        missing = [f for f in feature_names if f not in feature_row.index]
+        if missing:
+            return self._no_signal(base, f"Feature-Inkonsistenz ({len(missing)} fehlen) – Modell neu trainieren.")
+
+        nan_required = [f for f in required_features if pd.isna(feature_row.get(f))]
+        if nan_required:
+            return self._no_signal(
+                base,
+                f"{len(nan_required)} Pflicht-Indikatoren haben noch keinen Wert "
+                f"(z.B. {nan_required[0]}). Lade mehr historische Daten.",
+            )
+
+        X = feature_row[feature_names].to_numpy(dtype=float).reshape(1, -1)
+        dir_proba = (calibration or Calibration()).apply(
+            predict_proba_aligned(direction_model, X), np.array(class_prior)
+        )[0]
+        vol_proba = (volatility_calibration or Calibration()).apply(
+            predict_proba_aligned(volatility_model, X), np.array(volatility_prior)
+        )[0]
+
+        dir_class = int(np.argmax(dir_proba))
+        vol_class = int(np.argmax(vol_proba))
+        max_conf = float(dir_proba[dir_class])
+        show = max_conf >= self._threshold
+        label = _DIRECTION_LABELS[dir_class]
+
+        reason = ""
+        if not show:
+            reason = (
+                f"Die höchste Klassenwahrscheinlichkeit liegt bei {max_conf:.0%} "
+                f"(Schwelle: {self._threshold:.0%}). Das Modell ist sich aktuell nicht sicher genug."
+            )
 
         return PredictionResult(
-            direction_label=_DIRECTION_LABELS[dir_class],
+            direction_label=label,
             direction_emoji=_DIRECTION_EMOJIS[dir_class],
             direction_class=dir_class,
-            confidence=confidence,
-            show_signal=show_signal,
-            probabilities=probabilities,
-            volatility_label=_VOLATILITY_LABELS[vola_class],
-            volatility_color=_VOLATILITY_COLORS[vola_class],
-            volatility_class=vola_class,
-            horizon_days=self._horizon,
-            data_end_date=data_end_date,
-            no_signal_reason=no_signal_reason,
+            confidence=max_conf if show else None,
+            show_signal=show,
+            probabilities={_DIRECTION_LABELS[i]: round(float(p), 3) for i, p in enumerate(dir_proba)},
+            volatility_label=_VOLATILITY_LABELS[vol_class],
+            volatility_color=_VOLATILITY_COLORS[vol_class],
+            volatility_class=vol_class,
+            volatility_probabilities={_VOLATILITY_LABELS[i]: round(float(p), 3) for i, p in enumerate(vol_proba)},
+            no_signal_reason=reason,
+            historical=(signal_stats or {}).get(label, {}) if show else {},
+            **base,
         )
 
-    def _no_signal_result(self, data_end_date: str, reason: str) -> PredictionResult:
-        """Erstellt ein 'Kein Signal'-Ergebnis mit erklärendem Grund.
-
-        Args:
-            data_end_date: Datum des letzten Datenpunkts.
-            reason: Menschenlesbare Erklärung.
-
-        Returns:
-            PredictionResult mit show_signal=False.
-        """
+    @staticmethod
+    def _no_signal(base: dict[str, Any], reason: str) -> PredictionResult:
         return PredictionResult(
             direction_label="NEUTRAL",
             direction_emoji="🟡",
             direction_class=1,
             confidence=None,
             show_signal=False,
-            probabilities={"BEARISH": 0.0, "NEUTRAL": 1.0, "BULLISH": 0.0},
-            volatility_label="MITTEL",
-            volatility_color="orange",
+            probabilities={"BEARISH": 0.0, "NEUTRAL": 0.0, "BULLISH": 0.0},
+            volatility_label="–",
+            volatility_color="gray",
             volatility_class=1,
-            horizon_days=self._horizon,
-            data_end_date=data_end_date,
+            volatility_probabilities={},
             no_signal_reason=reason,
+            **base,
         )

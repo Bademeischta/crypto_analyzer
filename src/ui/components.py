@@ -1,519 +1,525 @@
-"""Wiederverwendbare Streamlit-UI-Komponenten.
+"""Wiederverwendbare UI-Bausteine: Plotly-Figuren und kleine Streamlit-Renderer.
 
-Alle Komponenten sind zustandslos (keine st.session_state Schreibzugriffe hier).
-Sie nehmen Daten entgegen und rendern HTML/Streamlit-Elemente.
+Alle Komponenten sind zustandslos (keine st.session_state-Schreibzugriffe).
+Figuren setzen bewusst keine Hintergrundfarben – so passen sie sich über
+Streamlits Plotly-Theme automatisch an Light- und Dark-Mode an.
 """
 
 from __future__ import annotations
 
+import html
+import math
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
 import streamlit as st
+from plotly.subplots import make_subplots
 
-from src.models.predictor import PredictionResult
+from src.features.technical import describe_feature
+from src.models.backtest import BacktestResult
 from src.models.evaluator import AggregatedMetrics
+from src.models.predictor import PredictionResult
+
+# Farbpalette (funktioniert auf hellem und dunklem Hintergrund)
+UP = "#16a34a"
+DOWN = "#dc2626"
+NEUTRAL = "#ca8a04"
+BLUE = "#2563eb"
+ORANGE = "#f59e0b"
+PURPLE = "#8b5cf6"
+TEAL = "#0d9488"
+GRAY = "#64748b"
+PINK = "#db2777"
+SERIES = [BLUE, ORANGE, PURPLE, TEAL, UP, DOWN, PINK, GRAY]
+
+SIGNAL_COLORS = {"BULLISH": UP, "NEUTRAL": NEUTRAL, "BEARISH": DOWN}
+VOLA_COLORS = {"NIEDRIG": UP, "MITTEL": NEUTRAL, "HOCH": DOWN}
+VERDICT_STYLE = {
+    "signifikant": ("✅", UP),
+    "schwach": ("ℹ️", NEUTRAL),
+    "keine Vorhersagekraft": ("⚠️", DOWN),
+}
 
 
-def render_disclaimer(disclaimer_text: str) -> None:
-    """Rendert den permanenten Pflicht-Disclaimer.
+def _layout(fig: go.Figure, height: int, **overrides: Any) -> go.Figure:
+    settings: dict[str, Any] = {
+        "height": height,
+        "margin": dict(l=8, r=8, t=36, b=8),
+        "legend": dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
+        "hovermode": "x unified",
+    }
+    fig.update_layout(**(settings | overrides))
+    return fig
 
-    Dieser Disclaimer ist nicht wegklickbar und erscheint immer am Seitenanfang.
 
-    Args:
-        disclaimer_text: Disclaimer-Text aus der Konfiguration.
-    """
-    st.error(
-        f"⚠️ **WICHTIGER HINWEIS**\n\n{disclaimer_text}",
-        icon="⚠️",
-    )
+# ===========================================================================
+# Formatierung
+# ===========================================================================
+
+def fmt_usd(value: float | None) -> str:
+    """Kompakte USD-Darstellung ($1.23T, $4.5B, $0.00001234)."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "–"
+    v = float(value)
+    for limit, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if abs(v) >= limit:
+            return f"${v / limit:,.2f}{suffix}"
+    if abs(v) >= 1000:
+        return f"${v:,.0f}"
+    if abs(v) >= 1:
+        return f"${v:,.2f}"
+    if v == 0:
+        return "$0"
+    # Memecoins: signifikante Stellen statt 0.00
+    digits = max(2, -int(math.floor(math.log10(abs(v)))) + 3)
+    return f"${v:.{digits}f}"
+
+
+def fmt_pct(value: float | None, digits: int = 1, signed: bool = True, ratio: bool = True) -> str:
+    """Prozent-Darstellung. ``ratio=True``: 0.05 → '+5.0%'."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "–"
+    v = float(value) * (100 if ratio else 1)
+    return f"{v:+.{digits}f}%" if signed else f"{v:.{digits}f}%"
+
+
+def escape_md(text: str) -> str:
+    """Neutralisiert Markdown/LaTeX in Fremdtexten (z.B. Reddit-Titel mit '$')."""
+    out = html.escape(str(text))
+    for ch in "\\`*_{}[]()#+!|$~>":
+        out = out.replace(ch, "\\" + ch)
+    return out
+
+
+# ===========================================================================
+# Karten & Badges (HTML)
+# ===========================================================================
+
+def render_disclaimer(text: str) -> None:
+    """Kompakter, permanent sichtbarer Pflicht-Hinweis."""
+    st.warning(text, icon="⚠️")
 
 
 def render_signal_card(prediction: PredictionResult) -> None:
-    """Rendert die KI-Signal-Karte mit Ampel-System.
-
-    Args:
-        prediction: PredictionResult aus dem Predictor.
-    """
+    """KI-Signal-Karte mit Horizont, Schwellen und historischer Einordnung."""
     if not prediction.show_signal:
-        st.warning(
-            f"**Kein klares Signal**\n\n{prediction.no_signal_reason}",
-            icon="🟡",
-        )
-        return
-
-    signal = prediction.direction_label
-    emoji = prediction.direction_emoji
-    conf = prediction.confidence
-    conf_pct = f"{conf:.0%}" if conf is not None else "–"
-    horizon = prediction.horizon_days
-
-    color_map = {"BULLISH": "#1a7f37", "NEUTRAL": "#b08800", "BEARISH": "#c82538"}
-    color = color_map.get(signal, "#888888")
-
-    st.markdown(
-        f"""
-        <div style="
-            background: {color}18;
-            border: 2px solid {color};
-            border-radius: 12px;
-            padding: 20px;
-            text-align: center;
-        ">
-            <div style="font-size: 3rem; line-height: 1;">{emoji}</div>
-            <div style="font-size: 1.8rem; font-weight: 700; color: {color}; margin: 8px 0;">
-                {signal}
-            </div>
-            <div style="font-size: 1rem; color: #666;">
-                Modell-Konfidenz: <strong>{conf_pct}</strong>
-            </div>
-            <div style="font-size: 0.85rem; color: #888; margin-top: 4px;">
-                Horizont: ~{horizon} Tage
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_volatility_badge(prediction: PredictionResult) -> None:
-    """Rendert das Volatilitäts-Risiko-Badge.
-
-    Args:
-        prediction: PredictionResult.
-    """
-    vola = prediction.volatility_label
-    color_map = {"NIEDRIG": "#1a7f37", "MITTEL": "#b08800", "HOCH": "#c82538"}
-    color = color_map.get(vola, "#888888")
-    bar_fill = {"NIEDRIG": "33%", "MITTEL": "66%", "HOCH": "100%"}.get(vola, "50%")
-
-    st.markdown(
-        f"""
-        <div style="padding: 12px 0;">
-            <div style="font-size: 0.85rem; color: #888; margin-bottom: 4px;">
-                Erwartetes Volatilitäts-Regime
-            </div>
-            <div style="font-size: 1.2rem; font-weight: 600; color: {color};">
-                {vola}
-            </div>
-            <div style="
-                background: #e0e0e0;
-                border-radius: 4px;
-                height: 8px;
-                margin-top: 6px;
-            ">
-                <div style="
-                    background: {color};
-                    width: {bar_fill};
-                    height: 8px;
-                    border-radius: 4px;
-                "></div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_probability_bars(prediction: PredictionResult) -> None:
-    """Rendert die Wahrscheinlichkeiten aller drei Klassen.
-
-    Args:
-        prediction: PredictionResult mit probabilities-Dict.
-    """
-    probs = prediction.probabilities
-    labels = ["BULLISH", "NEUTRAL", "BEARISH"]
-    colors = ["#1a7f37", "#b08800", "#c82538"]
-
-    for label, color in zip(labels, colors):
-        p = probs.get(label, 0.0)
         st.markdown(
             f"""
-            <div style="margin-bottom: 6px;">
-                <div style="display: flex; justify-content: space-between;
-                            font-size: 0.8rem; color: #555; margin-bottom: 2px;">
-                    <span>{label}</span>
-                    <span><strong>{p:.0%}</strong></span>
-                </div>
-                <div style="background: #e8e8e8; border-radius: 4px; height: 10px;">
-                    <div style="background: {color}; width: {p * 100:.1f}%;
-                                height: 10px; border-radius: 4px;"></div>
-                </div>
+            <div style="border:2px dashed {GRAY};border-radius:14px;padding:18px;text-align:center;">
+              <div style="font-size:2.4rem;line-height:1;">⚪</div>
+              <div style="font-size:1.4rem;font-weight:700;margin:6px 0;">Kein klares Signal</div>
+              <div style="font-size:.85rem;opacity:.8;">{html.escape(prediction.no_signal_reason)}</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
+        return
 
-
-def render_price_chart(df: pd.DataFrame, symbol: str) -> go.Figure:
-    """Erstellt einen interaktiven Preischart mit EMA-Overlays und Volumen.
-
-    Args:
-        df: OHLCV-DataFrame. Benötigt open, high, low, close, volume.
-            Optional: ema_fast_series, ema_mid_series für Overlays (werden ignoriert
-            wenn nicht vorhanden – Chart zeigt nur OHLCV).
-        symbol: Coin-Symbol für Titel.
-
-    Returns:
-        Plotly Figure.
-    """
-    fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.05,
-        row_heights=[0.75, 0.25],
-        subplot_titles=(f"{symbol} – Preis (OHLCV)", "Volumen"),
+    color = SIGNAL_COLORS.get(prediction.direction_label, GRAY)
+    hist = prediction.historical or {}
+    hist_line = ""
+    if hist.get("n_signals"):
+        hit = hist.get("direction_hit_rate", hist.get("hit_rate"))
+        hit_txt = fmt_pct(hit, 0, signed=False) if hit is not None and not math.isnan(hit) else "–"
+        hist_line = (
+            f"<div style='font-size:.8rem;opacity:.85;margin-top:8px;'>"
+            f"Historisch ({hist['n_signals']} vergleichbare Signale): Kurs lief in {hit_txt} der Fälle "
+            f"in Signalrichtung, Ø {fmt_pct(hist.get('avg_return'))} in {html.escape(prediction.horizon_text)}</div>"
+        )
+    st.markdown(
+        f"""
+        <div style="background:{color}14;border:2px solid {color};border-radius:14px;padding:18px;text-align:center;">
+          <div style="font-size:2.6rem;line-height:1;">{prediction.direction_emoji}</div>
+          <div style="font-size:1.8rem;font-weight:800;color:{color};margin:6px 0;">{prediction.direction_label}</div>
+          <div style="font-size:.95rem;">Wahrscheinlichkeit: <b>{prediction.confidence:.0%}</b>
+            · Horizont: <b>{html.escape(prediction.horizon_text)}</b></div>
+          {hist_line}
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    # Candlestick
-    fig.add_trace(
-        go.Candlestick(
-            x=df.index,
-            open=df["open"],
-            high=df["high"],
-            low=df["low"],
-            close=df["close"],
-            name="OHLCV",
-            increasing_line_color="#1a7f37",
-            decreasing_line_color="#c82538",
-        ),
-        row=1,
-        col=1,
+
+def render_probability_bars(probabilities: dict[str, float], colors: dict[str, str], order: list[str]) -> None:
+    """Horizontale Wahrscheinlichkeitsbalken."""
+    rows = []
+    for label in order:
+        p = float(probabilities.get(label, 0.0))
+        c = colors.get(label, GRAY)
+        rows.append(
+            f"<div style='margin-bottom:6px;'>"
+            f"<div style='display:flex;justify-content:space-between;font-size:.8rem;'>"
+            f"<span>{html.escape(label)}</span><b>{p:.0%}</b></div>"
+            f"<div style='background:{GRAY}33;border-radius:4px;height:9px;'>"
+            f"<div style='background:{c};width:{p * 100:.1f}%;height:9px;border-radius:4px;'></div></div></div>"
+        )
+    st.markdown("".join(rows), unsafe_allow_html=True)
+
+
+def render_verdict_badge(verdict: str, label: str) -> None:
+    """Kleines farbiges Badge für das Modell-Urteil."""
+    icon, color = VERDICT_STYLE.get(verdict, ("❔", GRAY))
+    st.markdown(
+        f"<span style='background:{color}1f;color:{color};border:1px solid {color};"
+        f"border-radius:999px;padding:2px 10px;font-size:.8rem;font-weight:600;'>"
+        f"{icon} {html.escape(label)}: {html.escape(verdict)}</span>",
+        unsafe_allow_html=True,
     )
 
-    # EMA-Overlays (wenn vorhanden)
-    for col_name, color, label in [
-        ("ema_fast_9", "#2196F3", "EMA 9"),
-        ("ema_mid_21", "#FF9800", "EMA 21"),
-        ("ema_long_50", "#9C27B0", "EMA 50"),
-    ]:
-        if col_name in df.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=df.index,
-                    y=df[col_name],
-                    name=label,
-                    line=dict(color=color, width=1.2),
-                    opacity=0.8,
-                ),
-                row=1,
-                col=1,
-            )
 
-    # Bollinger Bands (wenn vorhanden)
-    if "bb_upper" in df.columns and "bb_lower" in df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=df.index,
-                y=df["bb_upper"],
-                name="BB Oben",
-                line=dict(color="#607D8B", width=1, dash="dot"),
-                opacity=0.5,
-            ),
-            row=1, col=1,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=df.index,
-                y=df["bb_lower"],
-                name="BB Unten",
-                fill="tonexty",
-                fillcolor="rgba(96,125,139,0.08)",
-                line=dict(color="#607D8B", width=1, dash="dot"),
-                opacity=0.5,
-            ),
-            row=1, col=1,
-        )
+def render_market_header(market: dict[str, Any], closes: pd.Series, bars_per_day: float) -> None:
+    """Kennzahlen-Zeile: Preis, Änderungen, Market Cap, Volumen, Rang, ATH-Abstand."""
+    price = market.get("price") or (float(closes.iloc[-1]) if len(closes) else None)
+    change_7d = market.get("price_change_7d_pct")
+    if change_7d is None and len(closes) > 7 * bars_per_day:
+        change_7d = (closes.iloc[-1] / closes.iloc[-1 - int(7 * bars_per_day)] - 1) * 100
+    spark = closes.iloc[-int(30 * bars_per_day):].round(10).tolist() if len(closes) else None
 
-    # Volumen-Bars
-    colors_vol = [
-        "#1a7f37" if c >= o else "#c82538"
-        for c, o in zip(df["close"], df["open"])
+    cols = st.columns([1.35, 1, 1, 1, 0.8, 1])
+    cols[0].metric("Preis", fmt_usd(price), fmt_pct(market.get("price_change_24h_pct"), 2, ratio=False),
+                   chart_data=spark, chart_type="area", border=True, help="Live-Preis (Binance) · Δ 24h")
+    cols[1].metric("7 Tage", fmt_pct(change_7d, 2, ratio=False), border=True)
+    cols[2].metric("Market Cap", fmt_usd(market.get("market_cap_usd")), border=True,
+                   help="CoinGecko · FDV: " + fmt_usd(market.get("fdv_usd")))
+    cols[3].metric("Volumen 24h", fmt_usd(market.get("volume_24h_usd")), border=True)
+    cols[4].metric("Rang", f"#{market['rank']}" if market.get("rank") else "–", border=True,
+                   help="Market-Cap-Rang laut CoinGecko")
+    ath = market.get("ath_change_pct")
+    cols[5].metric("Abstand ATH", fmt_pct(ath, 1, ratio=False) if ath is not None else "–", border=True,
+                   help=f"Allzeithoch: {fmt_usd(market.get('ath_usd'))}")
+
+
+# ===========================================================================
+# Kurs- und Indikator-Charts
+# ===========================================================================
+
+def price_chart(
+    df: pd.DataFrame,
+    symbol: str,
+    features_cfg: dict[str, Any],
+    signals: pd.DataFrame | None = None,
+    log_scale: bool = False,
+) -> go.Figure:
+    """Candlestick + EMAs + Bollinger + Volumen, optional mit historischen Modellsignalen."""
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.78, 0.22])
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"], name=symbol,
+        increasing_line_color=UP, decreasing_line_color=DOWN, showlegend=False,
+    ), row=1, col=1)
+
+    if {"bb_upper", "bb_lower"} <= set(df.columns):
+        fig.add_trace(go.Scatter(x=df.index, y=df["bb_upper"], name="Bollinger", line=dict(color=GRAY, width=1, dash="dot"),
+                                 legendgroup="bb"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["bb_lower"], name="Bollinger", fill="tonexty",
+                                 fillcolor="rgba(100,116,139,0.08)", line=dict(color=GRAY, width=1, dash="dot"),
+                                 legendgroup="bb", showlegend=False), row=1, col=1)
+
+    ema_specs = [
+        (f"ema_fast_{features_cfg['ema_fast']}", BLUE, f"EMA {features_cfg['ema_fast']}"),
+        (f"ema_mid_{features_cfg['ema_mid']}", ORANGE, f"EMA {features_cfg['ema_mid']}"),
+        (f"ema_long_{features_cfg['ema_long_short']}", PURPLE, f"EMA {features_cfg['ema_long_short']}"),
+        (f"ema_long_{features_cfg['ema_long_long']}", TEAL, f"EMA {features_cfg['ema_long_long']}"),
     ]
-    fig.add_trace(
-        go.Bar(
-            x=df.index,
-            y=df["volume"],
-            name="Volumen",
-            marker_color=colors_vol,
-            opacity=0.7,
-        ),
-        row=2,
-        col=1,
+    for col, color, label in ema_specs:
+        if col in df.columns and df[col].notna().any():
+            fig.add_trace(go.Scatter(x=df.index, y=df[col], name=label, line=dict(color=color, width=1.3)), row=1, col=1)
+
+    if signals is not None and not signals.empty:
+        visible = signals[signals.index >= df.index[0]]
+        for label, marker, color, y_col in (("BULLISH", "triangle-up", UP, "low"), ("BEARISH", "triangle-down", DOWN, "high")):
+            pts = visible[visible["signal"] == label]
+            if pts.empty:
+                continue
+            y = df[y_col].reindex(pts.index) * (0.97 if label == "BULLISH" else 1.03)
+            fig.add_trace(go.Scatter(
+                x=pts.index, y=y, mode="markers", name=f"Signal {label.lower()}",
+                marker=dict(symbol=marker, size=9, color=color, line=dict(width=1, color="white")),
+                customdata=np.stack([pts["confidence"] * 100, pts["fwd_ret"] * 100], axis=1),
+                hovertemplate="%{x}<br>P=%{customdata[0]:.0f}% · danach %{customdata[1]:+.1f}%<extra></extra>",
+            ), row=1, col=1)
+
+    vol_colors = np.where(df["close"] >= df["open"], UP, DOWN)
+    fig.add_trace(go.Bar(x=df.index, y=df["volume"], name="Volumen", marker_color=vol_colors, opacity=0.6,
+                         showlegend=False), row=2, col=1)
+
+    fig.update_xaxes(rangeslider_visible=False)
+    fig.update_yaxes(type="log" if log_scale else "linear", row=1, col=1)
+    fig.update_yaxes(title_text="Vol.", row=2, col=1)
+    return _layout(fig, 600)
+
+
+def indicator_panel(df: pd.DataFrame, features_cfg: dict[str, Any]) -> go.Figure:
+    """RSI, MACD, ADX/DI und Stochastic in einem gemeinsamen Panel."""
+    rsi_s, rsi_l = f"rsi_{features_cfg['rsi_short_window']}", f"rsi_{features_cfg['rsi_long_window']}"
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+        subplot_titles=("RSI", "MACD", "ADX / DI", "Stochastic"),
     )
+    if rsi_l in df:
+        fig.add_trace(go.Scatter(x=df.index, y=df[rsi_l], name=f"RSI {features_cfg['rsi_long_window']}",
+                                 line=dict(color=BLUE, width=1.8)), row=1, col=1)
+    if rsi_s in df:
+        fig.add_trace(go.Scatter(x=df.index, y=df[rsi_s], name=f"RSI {features_cfg['rsi_short_window']}",
+                                 line=dict(color=ORANGE, width=1, dash="dot")), row=1, col=1)
+    for level, color in ((70, DOWN), (30, UP)):
+        fig.add_hline(y=level, line_dash="dash", line_color=color, opacity=0.5, row=1, col=1)
 
-    fig.update_layout(
-        height=550,
-        xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=0, r=0, t=30, b=0),
-    )
-    fig.update_xaxes(showgrid=True, gridcolor="#f0f0f0")
-    fig.update_yaxes(showgrid=True, gridcolor="#f0f0f0")
+    if "macd" in df:
+        hist = df["macd_diff"]
+        fig.add_trace(go.Bar(x=df.index, y=hist, name="MACD-Hist.", marker_color=np.where(hist >= 0, UP, DOWN),
+                             opacity=0.6), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["macd"], name="MACD", line=dict(color=BLUE, width=1.5)), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["macd_signal"], name="Signal", line=dict(color=ORANGE, width=1.2)),
+                      row=2, col=1)
 
-    return fig
+    if "adx" in df:
+        fig.add_trace(go.Scatter(x=df.index, y=df["adx"], name="ADX", line=dict(color=PURPLE, width=1.8)), row=3, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["adx_pos"], name="+DI", line=dict(color=UP, width=1)), row=3, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["adx_neg"], name="−DI", line=dict(color=DOWN, width=1)), row=3, col=1)
+        fig.add_hline(y=25, line_dash="dot", line_color=GRAY, opacity=0.6, row=3, col=1)
 
+    if "stoch_k" in df:
+        fig.add_trace(go.Scatter(x=df.index, y=df["stoch_k"], name="%K", line=dict(color=TEAL, width=1.5)), row=4, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["stoch_d"], name="%D", line=dict(color=ORANGE, width=1)), row=4, col=1)
+        for level in (80, 20):
+            fig.add_hline(y=level, line_dash="dash", line_color=GRAY, opacity=0.5, row=4, col=1)
 
-def render_rsi_chart(df: pd.DataFrame) -> go.Figure | None:
-    """Rendert RSI-Chart mit Overbought/Oversold-Linien.
-
-    Args:
-        df: DataFrame mit rsi_14 (und optional rsi_7) Spalte.
-
-    Returns:
-        Plotly Figure oder None wenn RSI nicht vorhanden.
-    """
-    if "rsi_14" not in df.columns:
-        return None
-
-    fig = go.Figure()
-    fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, annotation_text="Überkauft (70)")
-    fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5, annotation_text="Überverkauft (30)")
-    fig.add_hline(y=50, line_dash="dot", line_color="gray", opacity=0.3)
-
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["rsi_14"],
-        name="RSI(14)", line=dict(color="#2196F3", width=2),
-    ))
-    if "rsi_7" in df.columns:
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df["rsi_7"],
-            name="RSI(7)", line=dict(color="#FF9800", width=1.5, dash="dot"),
-        ))
-
-    fig.update_layout(
-        height=200,
-        showlegend=True,
-        margin=dict(l=0, r=0, t=20, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        yaxis=dict(range=[0, 100], showgrid=True, gridcolor="#f0f0f0"),
-        xaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
-    )
-    return fig
+    fig.update_yaxes(range=[0, 100], row=1, col=1)
+    fig.update_yaxes(range=[0, 100], row=4, col=1)
+    fig.update_layout(showlegend=False)
+    return _layout(fig, 720)
 
 
-def render_macd_chart(df: pd.DataFrame) -> go.Figure | None:
-    """Rendert MACD-Chart.
+def indicator_summary(df: pd.DataFrame, features_cfg: dict[str, Any]) -> pd.DataFrame:
+    """Aktuelle Indikatorwerte mit kurzer, regelbasierter Einordnung."""
+    last = df.iloc[-1]
+    rsi_col = f"rsi_{features_cfg['rsi_long_window']}"
 
-    Args:
-        df: DataFrame mit macd, macd_signal, macd_diff Spalten.
+    def val(col: str) -> float:
+        return float(last[col]) if col in last and pd.notna(last[col]) else float("nan")
 
-    Returns:
-        Plotly Figure oder None.
-    """
-    if "macd" not in df.columns:
-        return None
-
-    colors_hist = ["#1a7f37" if v >= 0 else "#c82538" for v in df["macd_diff"].fillna(0)]
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=df.index, y=df["macd_diff"],
-        name="Histogramm", marker_color=colors_hist, opacity=0.7,
-    ))
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["macd"],
-        name="MACD", line=dict(color="#2196F3", width=2),
-    ))
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["macd_signal"],
-        name="Signal", line=dict(color="#FF9800", width=1.5),
-    ))
-    fig.add_hline(y=0, line_color="gray", opacity=0.5)
-
-    fig.update_layout(
-        height=200,
-        margin=dict(l=0, r=0, t=20, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
-        yaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
-    )
-    return fig
+    rsi = val(rsi_col)
+    adx = val("adx")
+    di = val("di_diff")
+    bb = val("bb_pct")
+    macd_h = val("macd_hist_pct")
+    vol_ratio = val("volume_ratio")
+    ema_long = val("close_vs_ema_long")
+    taker = val("taker_buy_ratio")
+    rows = [
+        ("RSI (14)", f"{rsi:.1f}", "überkauft" if rsi > 70 else "überverkauft" if rsi < 30 else "neutral"),
+        ("MACD-Histogramm", f"{macd_h * 100:+.3f}% vom Kurs", "bullisches Momentum" if macd_h > 0 else "bärisches Momentum"),
+        ("ADX", f"{adx:.1f}", ("starker Trend" if adx > 25 else "kein klarer Trend") + (" ↑" if di > 0 else " ↓")),
+        ("Bollinger %B", f"{bb:.2f}", "am oberen Band" if bb > 0.95 else "am unteren Band" if bb < 0.05 else "innerhalb der Bänder"),
+        (f"Kurs vs. EMA {features_cfg['ema_long_short']}", fmt_pct(ema_long), "darüber" if ema_long > 0 else "darunter"),
+        ("Volumen vs. Ø", f"{vol_ratio:.2f}×", "erhöht" if vol_ratio > 1.5 else "niedrig" if vol_ratio < 0.6 else "normal"),
+        ("Hist. Volatilität (ann.)", fmt_pct(val("hist_vol"), 0, signed=False), ""),
+        ("Taker-Buy-Anteil", fmt_pct(taker + 0.5 if not math.isnan(taker) else None, 1, signed=False),
+         "Käufer aggressiver" if taker > 0.02 else "Verkäufer aggressiver" if taker < -0.02 else "ausgeglichen"),
+    ]
+    return pd.DataFrame(rows, columns=["Indikator", "Wert", "Einordnung"])
 
 
-def render_feature_importance_chart(importance: dict[str, float]) -> go.Figure:
-    """Rendert Feature-Importance als horizontales Balkendiagramm.
+# ===========================================================================
+# Modell-Transparenz
+# ===========================================================================
 
-    Args:
-        importance: Dict feature_name -> Wichtigkeit (in %, 0-100).
-
-    Returns:
-        Plotly Figure.
-    """
-    if not importance:
-        fig = go.Figure()
-        fig.update_layout(height=200, title="Keine Feature-Importance-Daten")
-        return fig
-
-    # Top 15 Features
-    top = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:15]
-    labels = [item[0] for item in reversed(top)]
-    values = [item[1] for item in reversed(top)]
-
+def feature_importance_chart(importance: dict[str, float], top_n: int = 15) -> go.Figure:
+    """Permutation-Importance: stärkste und schädlichste Features."""
+    items = list(importance.items())
+    top = items[:top_n]
+    worst = [kv for kv in items[-5:] if kv[1] < 0 and kv not in top]
+    data = list(reversed(top + worst))
     fig = go.Figure(go.Bar(
-        x=values,
-        y=labels,
+        x=[v for _, v in data],
+        y=[describe_feature(k) for k, _ in data],
         orientation="h",
-        marker_color="#2196F3",
-        opacity=0.8,
+        marker_color=[BLUE if v >= 0 else DOWN for _, v in data],
+        hovertemplate="%{y}: %{x:.1f}%<extra></extra>",
     ))
-    fig.update_layout(
-        height=max(300, len(labels) * 22),
-        margin=dict(l=0, r=0, t=10, b=0),
-        xaxis_title="Wichtigkeit (%)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
-        yaxis=dict(showgrid=False),
-    )
-    return fig
+    fig.update_xaxes(title_text="Anteil an der Out-of-Sample-Wichtigkeit (%)")
+    return _layout(fig, max(320, len(data) * 24), hovermode="closest")
 
 
-def render_fear_greed_gauge(current_value: int, label: str) -> go.Figure:
-    """Rendert den Fear & Greed Index als Tachometer-Chart.
+def fold_chart(metrics: AggregatedMetrics) -> go.Figure:
+    """Log-Loss je Walk-Forward-Fold: Modell vs. Prior-Baseline (niedriger = besser)."""
+    ft = pd.DataFrame(metrics.fold_table)
+    labels = [pd.Timestamp(s).strftime("%Y-%m-%d") for s in ft["start"]]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=labels, y=ft["log_loss_prior"], name="Baseline (Klassenhäufigkeit)", marker_color=GRAY, opacity=0.5))
+    fig.add_trace(go.Bar(x=labels, y=ft["log_loss"], name="Modell", marker_color=BLUE))
+    lo = float(min(ft["log_loss"].min(), ft["log_loss_prior"].min()))
+    hi = float(max(ft["log_loss"].max(), ft["log_loss_prior"].max()))
+    pad = max(0.01, (hi - lo) * 0.15)
+    fig.update_yaxes(title_text="Log-Loss", range=[lo - pad, hi + pad])
+    fig.update_xaxes(title_text="Beginn der Testperiode")
+    return _layout(fig, 320, barmode="group")
 
-    Args:
-        current_value: Aktueller Wert (0-100).
-        label: Textlabel (z.B. "Extreme Fear").
 
-    Returns:
-        Plotly Figure.
-    """
-    color = (
-        "#c82538" if current_value < 25
-        else "#FF9800" if current_value < 45
-        else "#607D8B" if current_value < 55
-        else "#4CAF50" if current_value < 75
-        else "#1a7f37"
-    )
+def calibration_chart(calibration: list[dict[str, float]]) -> go.Figure:
+    """Zuverlässigkeitsdiagramm: vorhergesagte Konfidenz vs. tatsächliche Trefferquote."""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=[1 / 3, 1], y=[1 / 3, 1], mode="lines", name="perfekt kalibriert",
+                             line=dict(color=GRAY, dash="dash")))
+    if calibration:
+        cal = pd.DataFrame(calibration)
+        fig.add_trace(go.Scatter(
+            x=cal["predicted"], y=cal["observed"], mode="lines+markers", name="Modell",
+            marker=dict(size=np.clip(np.sqrt(cal["count"]) * 1.5, 6, 22), color=BLUE),
+            customdata=cal["count"], hovertemplate="Konfidenz %{x:.0%} → Treffer %{y:.0%} (n=%{customdata})<extra></extra>",
+        ))
+    fig.update_xaxes(title_text="Vorhergesagte Wahrscheinlichkeit", tickformat=".0%", range=[0.3, 1])
+    fig.update_yaxes(title_text="Tatsächliche Trefferquote", tickformat=".0%", range=[0, 1])
+    return _layout(fig, 320, hovermode="closest")
 
+
+def confusion_chart(confusion: list[list[int]], labels: list[str]) -> go.Figure:
+    """Konfusionsmatrix als Heatmap (Zeilen = tatsächlich, Spalten = vorhergesagt)."""
+    z = np.array(confusion, dtype=float)
+    row_pct = z / np.maximum(z.sum(axis=1, keepdims=True), 1)
+    fig = go.Figure(go.Heatmap(
+        z=row_pct, x=labels, y=labels, colorscale="Blues", zmin=0, zmax=1, showscale=False,
+        text=[[f"{int(c)}<br>{p:.0%}" for c, p in zip(row, prow)] for row, prow in zip(z, row_pct)],
+        texttemplate="%{text}", hovertemplate="tatsächlich %{y} → vorhergesagt %{x}<extra></extra>",
+    ))
+    fig.update_xaxes(title_text="Vorhergesagt")
+    fig.update_yaxes(title_text="Tatsächlich", autorange="reversed")
+    return _layout(fig, 320, hovermode="closest")
+
+
+def signal_stats_table(stats: dict[str, dict[str, float]], unconditional: float) -> pd.DataFrame:
+    """Tabelle: Was passierte nach Signalen oberhalb der Konfidenzschwelle?"""
+    rows = []
+    for name in ("BULLISH", "BEARISH", "NEUTRAL"):
+        s = stats.get(name, {})
+        if not s.get("n_signals"):
+            continue
+        rows.append({
+            "Signal": name,
+            "Anzahl": str(int(s["n_signals"])),
+            "Anteil Zeit": fmt_pct(s.get("coverage"), 1, signed=False),
+            "Label korrekt": fmt_pct(s.get("hit_rate"), 0, signed=False),
+            "Kurs in Richtung": fmt_pct(s.get("direction_hit_rate"), 0, signed=False),
+            "Ø Return danach": fmt_pct(s.get("avg_return"), 2),
+        })
+    rows.append({"Signal": "alle Zeitpunkte", "Anzahl": "–", "Anteil Zeit": "100%", "Label korrekt": "–",
+                 "Kurs in Richtung": "–", "Ø Return danach": fmt_pct(unconditional, 2)})
+    return pd.DataFrame(rows)
+
+
+# ===========================================================================
+# Backtest
+# ===========================================================================
+
+def equity_chart(bt: BacktestResult, log_scale: bool = False) -> go.Figure:
+    """Equity-Kurven Strategie vs. Buy & Hold plus Drawdown."""
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+    for col, color in (("Strategie", BLUE), ("Buy & Hold", GRAY)):
+        fig.add_trace(go.Scatter(x=bt.equity.index, y=bt.equity[col], name=col, line=dict(color=color, width=2)),
+                      row=1, col=1)
+        fig.add_trace(go.Scatter(x=bt.drawdown.index, y=bt.drawdown[col], name=f"Drawdown {col}", showlegend=False,
+                                 fill="tozeroy", line=dict(color=color, width=1)), row=2, col=1)
+    exposure = bt.position.replace(0, np.nan)
+    fig.add_trace(go.Scatter(
+        x=exposure.index, y=np.where(exposure.notna(), bt.equity["Strategie"], np.nan),
+        mode="markers", marker=dict(size=3, color=np.where(exposure > 0, UP, DOWN)), name="investiert",
+    ), row=1, col=1)
+    fig.update_yaxes(title_text="Wert (Start = 1)", type="log" if log_scale else "linear", row=1, col=1)
+    fig.update_yaxes(title_text="Drawdown", tickformat=".0%", row=2, col=1)
+    return _layout(fig, 520)
+
+
+def backtest_table(bt: BacktestResult) -> pd.DataFrame:
+    """Kennzahlen Strategie vs. Buy & Hold nebeneinander."""
+    spec = [
+        ("Gesamtrendite", "total_return", "pct"),
+        ("CAGR", "cagr", "pct"),
+        ("Volatilität (ann.)", "ann_volatility", "pct"),
+        ("Sharpe Ratio", "sharpe", "num"),
+        ("Sortino Ratio", "sortino", "num"),
+        ("Max. Drawdown", "max_drawdown", "dd"),
+        ("Calmar Ratio", "calmar", "num"),
+    ]
+
+    def fmt(v: float | None, kind: str) -> str:
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return "–"
+        if kind == "dd":
+            return fmt_pct(v, signed=False)
+        return fmt_pct(v) if kind == "pct" else f"{v:.2f}"
+
+    rows = [{"Kennzahl": label, "Strategie": fmt(bt.strategy.get(key), kind), "Buy & Hold": fmt(bt.buy_hold.get(key), kind)}
+            for label, key, kind in spec]
+    s = bt.strategy
+    rows += [
+        {"Kennzahl": "Zeit investiert", "Strategie": fmt_pct(s.get("exposure"), 0, signed=False), "Buy & Hold": "100%"},
+        {"Kennzahl": "Anzahl Trades", "Strategie": str(s.get("n_trades", 0)), "Buy & Hold": "1"},
+        {"Kennzahl": "Gewinn-Trades", "Strategie": fmt(s.get("win_rate"), "pct").lstrip("+"), "Buy & Hold": "–"},
+        {"Kennzahl": "Ø Trade", "Strategie": fmt(s.get("avg_trade"), "pct"), "Buy & Hold": "–"},
+        {"Kennzahl": "Kosten gesamt", "Strategie": fmt_pct(s.get("costs_paid"), 2, signed=False), "Buy & Hold": "–"},
+    ]
+    return pd.DataFrame(rows)
+
+
+# ===========================================================================
+# Sentiment
+# ===========================================================================
+
+def fear_greed_gauge(value: int, label: str) -> go.Figure:
+    """Fear & Greed Index als Tachometer."""
+    color = DOWN if value < 25 else ORANGE if value < 46 else GRAY if value < 55 else "#65a30d" if value < 76 else UP
     fig = go.Figure(go.Indicator(
-        mode="gauge+number+delta",
-        value=current_value,
-        title={"text": f"Fear & Greed Index<br><span style='font-size:0.8em'>{label}</span>"},
+        mode="gauge+number", value=value,
+        title={"text": html.escape(label), "font": {"size": 18}},
         gauge={
-            "axis": {"range": [0, 100], "tickwidth": 1},
+            "axis": {"range": [0, 100]},
             "bar": {"color": color},
             "steps": [
-                {"range": [0, 25], "color": "#ffebee"},
-                {"range": [25, 45], "color": "#fff3e0"},
-                {"range": [45, 55], "color": "#f5f5f5"},
-                {"range": [55, 75], "color": "#e8f5e9"},
-                {"range": [75, 100], "color": "#c8e6c9"},
+                {"range": [0, 25], "color": "rgba(220,38,38,.18)"},
+                {"range": [25, 46], "color": "rgba(245,158,11,.15)"},
+                {"range": [46, 55], "color": "rgba(100,116,139,.12)"},
+                {"range": [55, 76], "color": "rgba(101,163,13,.15)"},
+                {"range": [76, 100], "color": "rgba(22,163,74,.2)"},
             ],
-            "threshold": {
-                "line": {"color": "black", "width": 2},
-                "thickness": 0.75,
-                "value": current_value,
-            },
         },
     ))
-    fig.update_layout(
-        height=250,
-        margin=dict(l=20, r=20, t=40, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-    )
+    fig.update_layout(height=260, margin=dict(l=24, r=24, t=48, b=8))
     return fig
 
 
-def render_model_performance_badge(metrics: AggregatedMetrics) -> None:
-    """Rendert den Modell-Performance-Badge mit ehrlicher Accuracy-Anzeige.
-
-    Args:
-        metrics: AggregatedMetrics aus dem Evaluator.
-    """
-    acc_pct = f"{metrics.avg_accuracy:.0%}"
-    baseline_pct = f"{metrics.baseline_accuracy:.0%}"
-    beats_pct = f"{metrics.beats_baseline_pct:.0%}"
-    mcc = f"{metrics.avg_mcc:+.2f}"
-
-    badge_color = "#1a7f37" if metrics.model_is_useful else "#b08800"
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric(
-            "Historische Trefferquote",
-            acc_pct,
-            help="Wie oft lag das Modell in historischen Testperioden richtig?",
-        )
-    with col2:
-        st.metric(
-            "Baseline (immer NEUTRAL)",
-            baseline_pct,
-            help="Naive Strategie: Immer 'NEUTRAL' vorherzusagen. Das Modell sollte besser sein.",
-        )
-    with col3:
-        delta_vs_base = metrics.avg_accuracy - metrics.baseline_accuracy
-        st.metric(
-            "Schlägt Baseline in",
-            beats_pct,
-            delta=f"{delta_vs_base:+.1%} vs. Baseline",
-            help="Anteil der Testperioden wo das Modell besser als die Baseline war.",
-        )
-    with col4:
-        st.metric(
-            "MCC (Qualitäts-Score)",
-            mcc,
-            help="Matthews Correlation Coefficient: 0 = zufällig, +1 = perfekt, -1 = immer falsch.",
-        )
-
-    st.caption(metrics.disclaimer)
+def fear_greed_history_chart(history: list[dict[str, Any]]) -> go.Figure:
+    """Verlauf des Fear & Greed Index."""
+    h = pd.DataFrame(history)
+    fig = go.Figure(go.Scatter(x=pd.to_datetime(h["date"]), y=h["value"], mode="lines", fill="tozeroy",
+                               line=dict(color=BLUE, width=1.5), name="Fear & Greed"))
+    for level, color in ((25, DOWN), (75, UP)):
+        fig.add_hline(y=level, line_dash="dot", line_color=color, opacity=0.6)
+    fig.update_yaxes(range=[0, 100])
+    return _layout(fig, 260)
 
 
-def render_market_data_row(market_data: dict[str, Any]) -> None:
-    """Rendert die Marktdaten-Kennzahlen in einer Zeile.
+# ===========================================================================
+# Vergleich
+# ===========================================================================
 
-    Args:
-        market_data: Dict aus CoinGeckoFetcher.get_market_data().
-    """
-    def fmt_large(val: float | None, suffix: str = "") -> str:
-        if val is None:
-            return "–"
-        if val >= 1e12:
-            return f"${val/1e12:.2f}T{suffix}"
-        if val >= 1e9:
-            return f"${val/1e9:.2f}B{suffix}"
-        if val >= 1e6:
-            return f"${val/1e6:.2f}M{suffix}"
-        return f"${val:,.0f}{suffix}"
+def comparison_chart(normalized: pd.DataFrame) -> go.Figure:
+    """Relative Performance (Start = 100)."""
+    fig = go.Figure()
+    for i, sym in enumerate(normalized.columns):
+        fig.add_trace(go.Scatter(x=normalized.index, y=normalized[sym], name=sym, mode="lines",
+                                 line=dict(color=SERIES[i % len(SERIES)], width=2)))
+    fig.add_hline(y=100, line_dash="dot", line_color=GRAY)
+    fig.update_yaxes(title_text="Index (Start = 100)")
+    return _layout(fig, 420)
 
-    cols = st.columns(5)
-    data_points = [
-        ("Market Cap", fmt_large(market_data.get("market_cap_usd")), "Gesamtmarktwert aller im Umlauf befindlichen Coins"),
-        ("24h Volumen", fmt_large(market_data.get("volume_24h_usd")), "Gesamthandelsvol. der letzten 24 Stunden"),
-        ("24h Änderung", (
-            f"{market_data['price_change_24h_pct']:.2f}%"
-            if market_data.get("price_change_24h_pct") is not None
-            else "–"
-        ), "Preisveränderung in den letzten 24 Stunden"),
-        ("7d Änderung", (
-            f"{market_data['price_change_7d_pct']:.2f}%"
-            if market_data.get("price_change_7d_pct") is not None
-            else "–"
-        ), "Preisveränderung der letzten 7 Tage"),
-        ("CMC Rank", (
-            f"#{market_data['rank']}"
-            if market_data.get("rank") is not None
-            else "–"
-        ), "Position im CoinMarketCap-Ranking nach Market Cap"),
-    ]
 
-    for col, (label, value, help_text) in zip(cols, data_points):
-        with col:
-            delta = None
-            if "Änderung" in label:
-                try:
-                    num = float(value.replace("%", ""))
-                    delta = f"{num:+.2f}%"
-                    value = f"{num:.2f}%"
-                except (ValueError, AttributeError):
-                    pass
-            st.metric(label, value, help=help_text)
+def correlation_heatmap(corr: pd.DataFrame) -> go.Figure:
+    """Korrelationsmatrix der Returns."""
+    fig = go.Figure(go.Heatmap(
+        z=corr.values, x=corr.columns, y=corr.index, zmin=-1, zmax=1, colorscale="RdBu", reversescale=True,
+        text=np.round(corr.values, 2), texttemplate="%{text}", showscale=False,
+    ))
+    fig.update_yaxes(autorange="reversed")
+    return _layout(fig, 60 + 50 * len(corr), hovermode="closest")

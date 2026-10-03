@@ -1,0 +1,11 @@
+[browser]
+# Keine Nutzungsstatistiken an Streamlit senden
+gatherUsageStats = false
+
+[client]
+# Lokale App: "Deploy"-Button und Entwickler-Menü ausblenden
+toolbarMode = "minimal"
+
+[server]
+# Nur lokal erreichbar (nicht im Netzwerk freigeben)
+address = "localhost"
