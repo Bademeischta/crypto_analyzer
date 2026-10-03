@@ -54,6 +54,8 @@ logs/
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
+# Ausnahme: das mitgelieferte Colab-Notebook
+!notebooks/*.ipynb
 
 # pytest / coverage
 .pytest_cache/
