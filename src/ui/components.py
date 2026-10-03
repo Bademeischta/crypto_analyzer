@@ -195,6 +195,28 @@ def render_market_header(market: dict[str, Any], closes: pd.Series, bars_per_day
 # Kurs- und Indikator-Charts
 # ===========================================================================
 
+def historical_signals(oof: pd.DataFrame | None, threshold: float) -> pd.DataFrame:
+    """Out-of-Sample-Signale über der Konfidenzschwelle (für Chart-Marker).
+
+    Returns:
+        DataFrame mit signal ("BULLISH"/"BEARISH"), confidence und fwd_ret je Zeitpunkt.
+    """
+    if oof is None or oof.empty:
+        return pd.DataFrame(columns=["signal", "confidence", "fwd_ret"])
+    proba = oof[["p_down", "p_neutral", "p_up"]].to_numpy()
+    best = proba.argmax(axis=1)
+    conf = proba.max(axis=1)
+    mask = (conf >= threshold) & (best != 1)
+    return pd.DataFrame(
+        {
+            "signal": np.array(["BEARISH", "NEUTRAL", "BULLISH"])[best][mask],
+            "confidence": conf[mask],
+            "fwd_ret": oof["fwd_ret"].to_numpy()[mask],
+        },
+        index=oof.index[mask],
+    )
+
+
 def price_chart(
     df: pd.DataFrame,
     symbol: str,

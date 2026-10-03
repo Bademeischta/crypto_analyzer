@@ -35,6 +35,22 @@ Voraussetzungen: Python 3.11+, Internetverbindung (Binance, CoinGecko, alternati
 
 ---
 
+## Google Colab (ohne Installation)
+
+[![In Colab öffnen](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Bademeischta/crypto_analyzer/blob/v2/notebooks/crypto_analyzer_colab.ipynb)
+
+Link öffnen und die Zellen von oben nach unten ausführen. Das Notebook
+[`notebooks/crypto_analyzer_colab.ipynb`](notebooks/crypto_analyzer_colab.ipynb) bietet Analyse,
+Modellqualität, Backtest, Coin-Vergleich und Scanner direkt als Zellen mit Formularfeldern – und startet auf Wunsch
+das komplette Dashboard über einen Cloudflare-Tunnel (öffentlicher `…trycloudflare.com`-Link, kein Account nötig).
+
+- Colab-Laufzeiten sind flüchtig: Cache und Modelle optional in Google Drive speichern (Häkchen in Schritt 1).
+- Colab-Server stehen meist in den USA, wo `api.binance.com` gesperrt ist – die App nutzt dann automatisch den
+  offiziellen Mirror `data-api.binance.vision`.
+- CoinGecko teilt sein kostenloses Rate-Limit mit allen Colab-Nutzern; Market Cap & Rang können daher fehlen.
+
+---
+
 ## Funktionen
 
 | Tab | Inhalt |
@@ -130,8 +146,11 @@ crypto_analyzer/
 │   │   ├── evaluator.py   ← Log-Loss-Skill, Signifikanz, Kalibrierung, Signalstatistik
 │   │   ├── backtest.py    ← Vektorisierter Backtest inkl. Kosten
 │   │   └── predictor.py   ← Live-Signal mit Kontext
-│   ├── analysis/analyzer.py ← Orchestrierung, Vergleich, Scanner
+│   ├── analysis/
+│   │   ├── analyzer.py    ← Orchestrierung, Vergleich, Scanner
+│   │   └── report.py      ← Text-Zusammenfassung (CLI & Notebook)
 │   └── ui/                ← Streamlit-Dashboard + Plotly-Komponenten (Light/Dark)
+├── notebooks/             ← Google-Colab-Notebook
 └── tests/                 ← 95 Offline-Tests (pytest), u.a. Lookahead-, Stationaritäts-, Backtest-Tests
 ```
 

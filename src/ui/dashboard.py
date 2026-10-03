@@ -167,20 +167,6 @@ def _render_sidebar(config: dict[str, Any], analyzer: CryptoAnalyzer) -> tuple[s
 # Tabs
 # ===========================================================================
 
-def _signals_from_oof(result: AnalysisResult, threshold: float) -> pd.DataFrame:
-    """Historische Out-of-Sample-Signale über der Schwelle (für Chart-Marker)."""
-    oof = result.oof
-    if oof is None or oof.empty:
-        return pd.DataFrame()
-    proba = oof[["p_down", "p_neutral", "p_up"]].to_numpy()
-    best = proba.argmax(axis=1)
-    conf = proba.max(axis=1)
-    labels = np.array(["BEARISH", "NEUTRAL", "BULLISH"])[best]
-    mask = (conf >= threshold) & (best != 1)
-    return pd.DataFrame({"signal": labels[mask], "confidence": conf[mask], "fwd_ret": oof["fwd_ret"].to_numpy()[mask]},
-                        index=oof.index[mask])
-
-
 def _tab_chart(result: AnalysisResult, config: dict[str, Any]) -> None:
     chart_col, signal_col = st.columns([2.3, 1], gap="large")
     threshold = config["ml"]["confidence_display_threshold"]
@@ -191,7 +177,7 @@ def _tab_chart(result: AnalysisResult, config: dict[str, Any]) -> None:
                                  disabled=result.oof is None,
                                  help="Out-of-Sample-Signale aus dem Walk-Forward (▲ bullish, ▼ bearish)")
         log_scale = c2.toggle("Log-Skala", value=False)
-        signals = _signals_from_oof(result, threshold) if show_signals else None
+        signals = ui.historical_signals(result.oof, threshold) if show_signals else None
         st.plotly_chart(ui.price_chart(result.ohlcv, result.symbol, config["features"], signals, log_scale),
                         width="stretch")
 

@@ -54,6 +54,8 @@ ehrlich out-of-sample bewertet. Dazu kommen deutlich mehr Analysefunktionen und 
 - CoinGecko: Community-Sentiment, ATH-Abstand, FDV; Binance-Ticker für Live-Preis.
 - Alle Datenquellen einer Analyse werden parallel geladen.
 - CLI: `check`, `analyze` (inkl. `--json`), `scan`, `clear-cache`; `python main.py` startet das Dashboard.
+- Google-Colab-Notebook (`notebooks/crypto_analyzer_colab.ipynb`): Analyse, Modellqualität, Backtest, Vergleich
+  und Scanner als Formular-Zellen, optionales Speichern in Google Drive, Dashboard über Cloudflare-Tunnel.
 - 95 Offline-Tests (u.a. Lookahead-, Stationaritäts-, Kalibrierungs-, Backtest- und Integrationstests),
   Ruff-Linting, GitHub-Actions-CI (Linux/Windows, beide Engines).
 - Logging mit rotierender Logdatei (`data/logs/`).

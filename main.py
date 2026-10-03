@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import math
 import subprocess
 import sys
 from pathlib import Path
@@ -110,15 +109,10 @@ def cmd_check(_: argparse.Namespace) -> int:
     return 0
 
 
-def _fmt_pct(value: float | None, ratio: bool = True) -> str:
-    if value is None or (isinstance(value, float) and math.isnan(value)):
-        return "–"
-    return f"{value * (100 if ratio else 1):+.2f}%"
-
-
 def cmd_analyze(args: argparse.Namespace) -> int:
     """Analyse eines Coins im Terminal."""
     from src.analysis.analyzer import CryptoAnalyzer
+    from src.analysis.report import format_summary
 
     analyzer = CryptoAnalyzer()
     result = analyzer.analyze(
@@ -155,33 +149,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, ensure_ascii=False, default=lambda o: None if o != o else str(o)))
         return 0
 
-    md = result.market_data
     print()
-    print(f"═══ {md.get('name', result.symbol)} ({result.symbol}) · {result.interval} ═══")
-    print(f"Preis: {md.get('price', '–')}  ·  24h: {_fmt_pct(md.get('price_change_24h_pct'), ratio=False)}"
-          f"  ·  Rang: #{md.get('rank') or '–'}")
-    if result.ml_error:
-        print(f"\nKI-Analyse nicht möglich: {result.ml_error}")
-        return 0
-    print(f"\nSignal ({p.horizon_text}): "
-          + (f"{p.direction_emoji} {p.direction_label} ({p.confidence:.0%})" if p.show_signal else "⚪ kein klares Signal"))
-    print("  Wahrscheinlichkeiten: " + ", ".join(f"{k} {val:.0%}" for k, val in p.probabilities.items()))
-    print(f"  Schwellen: BULLISH > {p.up_threshold_pct:+.2f}%, BEARISH < {p.down_threshold_pct:+.2f}%")
-    print(f"  Volatilität: {p.volatility_label} (" + ", ".join(f"{k} {val:.0%}" for k, val in p.volatility_probabilities.items()) + ")")
-    if m:
-        print(f"\nModellqualität (out-of-sample, {m.n_folds} Folds, {m.n_samples} Vorhersagen)")
-        print(f"  Richtung:   {m.verdict:<22} Skill {m.skill_score:+.1%}  p={m.p_value:.3f}  "
-              f"Treffer {m.accuracy:.0%} vs. {m.baseline_accuracy:.0%}  MCC {m.mcc:+.3f}")
-        if v:
-            print(f"  Volatilität: {v.verdict:<21} Skill {v.skill_score:+.1%}  p={v.p_value:.3f}  MCC {v.mcc:+.3f}")
-    if bt:
-        s, b = bt.strategy, bt.buy_hold
-        print(f"\nBacktest {bt.params['start'][:10]} → {bt.params['end'][:10]} (nach Kosten)")
-        print(f"  Strategie:  Rendite {_fmt_pct(s['total_return'])}  Sharpe {s['sharpe']:.2f}  "
-              f"MaxDD {_fmt_pct(s['max_drawdown'])}  investiert {s['exposure']:.0%}  Trades {s['n_trades']}")
-        print(f"  Buy & Hold: Rendite {_fmt_pct(b['total_return'])}  Sharpe {b['sharpe']:.2f}  MaxDD {_fmt_pct(b['max_drawdown'])}")
-    print(f"\nLaufzeit: {sum(result.timings.values()):.1f}s {result.timings}")
-    print("⚠️  Keine Finanzberatung.")
+    print(format_summary(result))
     return 0
 
 

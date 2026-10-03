@@ -10,9 +10,11 @@ import pytest
 
 from conftest import make_fear_greed, make_ohlcv
 from src.analysis.analyzer import CryptoAnalyzer
+from src.analysis.report import format_summary
 from src.config import load_config, resolve_path
 from src.data.cache import DiskCache
 from src.data.fetcher import SymbolNotFoundError
+from src.ui import components as ui
 
 
 class FakeFetcher:
@@ -104,6 +106,14 @@ def test_full_analysis_and_model_cache(analyzer):
     assert any("Trainiere" in m for m in messages)
     assert result.model_info["from_cache"] is False
 
+    summary = format_summary(result)
+    assert "XYZ Coin (XYZ)" in summary and "Modellqualität" in summary and "Backtest" in summary
+
+    signals = ui.historical_signals(result.oof, threshold=0.0)
+    assert set(signals["signal"]) <= {"BULLISH", "BEARISH"}
+    assert signals.index.isin(result.oof.index).all()
+    assert ui.historical_signals(None, 0.5).empty
+
     cached = analyzer.analyze("XYZ", "1d", lookback_days=180)
     assert cached.model_info["from_cache"] is True
     assert cached.training_time_seconds == 0.0
@@ -116,6 +126,7 @@ def test_short_history_degrades_gracefully(analyzer):
     assert result.ml_error and "Zu wenig Historie" in result.ml_error
     assert result.prediction is None
     assert not result.ohlcv.empty and "rsi_14" in result.ohlcv.columns
+    assert "KI-Analyse nicht möglich" in format_summary(result)
 
 
 def test_unknown_and_invalid_symbols(analyzer):
